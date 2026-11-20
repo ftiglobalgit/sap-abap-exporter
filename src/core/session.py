@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterator, List, Optional, Sequence
+from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
 LogFn = Callable[[str], None]
 
@@ -24,6 +24,18 @@ class SapGuiError(RuntimeError):
 
 class ScriptingDisabledError(SapGuiError):
     """SAP GUI Scripting is switched off on the client or on the server."""
+
+
+class DebuggerOpenError(SapGuiError):
+    """The ABAP Debugger is on screen - a program is executing.
+
+    The exporter must never continue in this state: it would be typing and
+    pressing buttons inside a live debugging session.
+    """
+
+
+# The debugger titles itself e.g. "ABAP Debugger(1) (Exclusive) (host_DE4_01)"
+DEBUGGER_TITLE = re.compile(r"\bABAP[\s-]?Debugger\b|\bDebugger\b", re.I)
 
 
 def _noop(_msg: str) -> None:
@@ -286,6 +298,40 @@ class SapSession:
     def send_vkey(self, key: int, window: str = "wnd[0]") -> None:
         self.find(window).sendVKey(key)
 
+    # -- safety ----------------------------------------------------------
+
+    def is_debugger_open(self) -> bool:
+        """True if this session is showing the ABAP Debugger."""
+        if DEBUGGER_TITLE.search(self.window_title() or ""):
+            return True
+        try:
+            if DEBUGGER_TITLE.search(str(self.session.Info.Transaction or "")):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def assert_safe_to_navigate(self) -> None:
+        """Refuse to drive the GUI while a program is executing.
+
+        Called before and after every navigation step.  Driving the screen
+        inside a debugger means pressing buttons in a running program, which
+        can step, change variables or commit work.
+        """
+        if self.is_debugger_open():
+            raise DebuggerOpenError(
+                "The ABAP Debugger is open - a program is currently executing.\n\n"
+                f"Window: {self.window_title()!r}\n\n"
+                "The export has stopped and will not touch the screen while the "
+                "debugger is on.\n\n"
+                "What to do:\n"
+                "  1. Switch to SAP and leave the debugger (Debugger > Exit, or "
+                "Shift+F3).\n"
+                "  2. Remove or deactivate breakpoints in this program "
+                "(Utilities > Breakpoints > Delete > All).\n"
+                "  3. Go back to SE80/SE38 and run the export again."
+            )
+
     def status_message(self) -> str:
         bar = self.maybe("wnd[0]/sbar")
         if bar is None:
@@ -361,6 +407,7 @@ class SapSession:
 
     def start_transaction(self, tcode: str, wait: float = 0.25) -> None:
         """Enter /n<tcode> in the command field. Works from any screen."""
+        self.assert_safe_to_navigate()
         okcd = self.maybe("wnd[0]/tbar[0]/okcd")
         if okcd is None:
             raise SapGuiError(
@@ -372,10 +419,45 @@ class SapSession:
         time.sleep(wait)
         self.dismiss_popups()
 
-    def press_menu(self, path: Sequence[str], window: str = "wnd[0]") -> bool:
+    def find_button(
+        self,
+        want: re.Pattern,
+        forbid: Optional[re.Pattern] = None,
+        toolbar: str = "wnd[0]/tbar[1]",
+    ):
+        """Find a toolbar button by what it *says*, not by its index.
+
+        Button indices are not stable across SAP releases, screen variants or
+        user layouts.  Pressing `tbar[1]/btn[17]` because it is usually
+        "Display" is how this tool once managed to press "Execute" instead and
+        launch the program into the debugger.  Never again: a button is only
+        pressed when its own label or tooltip identifies it, and never when it
+        matches the *forbid* pattern.
+        """
+        for comp in self.walk(toolbar, max_depth=4):
+            if comp.type != "GuiButton":
+                continue
+            label = f"{comp.text or ''} {_safe(comp.obj, 'Tooltip')}".strip()
+            if not label:
+                continue
+            if forbid is not None and forbid.search(label):
+                continue
+            if want.search(label):
+                return comp.obj, label
+        return None, ""
+
+    def press_menu(
+        self,
+        path: Sequence[str],
+        window: str = "wnd[0]",
+        forbid: Optional[re.Pattern] = None,
+    ) -> bool:
         """Select a menu entry by visible text, matching case-insensitively and
         ignoring the '&' accelerator markers.  Each element of *path* may be a
-        regular expression, which lets us carry English + German labels."""
+        regular expression, which lets us carry English + German labels.
+
+        *forbid* rejects a candidate entry outright - used to make sure a
+        loose pattern can never land on Execute/Run/Test."""
         node = self.maybe(f"{window}/mbar")
         if node is None:
             return False
@@ -393,6 +475,8 @@ class SapSession:
                 except Exception:
                     continue
                 label = str(_safe(child, "Text")).replace("&", "").strip()
+                if forbid is not None and forbid.search(label):
+                    continue
                 if pattern.fullmatch(label) or pattern.search(label):
                     nxt = child
                     break

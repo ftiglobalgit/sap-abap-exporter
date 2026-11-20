@@ -272,12 +272,22 @@ class ExporterApp:
 
     def dump_tree(self) -> None:
         def job():
+            from core.editor import probe_editor
+
             sap = self._connect()
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             out = os.path.join(self.var_output.get() or os.getcwd(),
                                f"sapgui_tree_{stamp}.txt")
             os.makedirs(os.path.dirname(out), exist_ok=True)
             sap.dump_tree(out)
+            try:
+                probe = probe_editor(sap)
+                with open(out, "a", encoding="utf-8") as fh:
+                    fh.write("\n" + probe + "\n")
+                for line in probe.splitlines():
+                    self._post("log", line)
+            except Exception as exc:
+                self._post("log", f"(editor probe failed: {exc})")
             self._post("log", f"Component tree written to {out}")
             self._post("info", f"Diagnostics written to:\n{out}")
         self._run_worker(job)

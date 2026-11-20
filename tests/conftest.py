@@ -33,6 +33,10 @@ if sys.platform != "win32":
     stub.window_title = lambda *a, **k: ""
     stub.get_clipboard_text = lambda *a, **k: ""
     stub.clear_clipboard = lambda *a, **k: None
+    stub.set_clipboard_text = lambda *a, **k: None
+    stub.click_at = lambda *a, **k: None
+    stub.get_cursor_pos = lambda *a, **k: (0, 0)
+    stub.set_cursor_pos = lambda *a, **k: None
 
     import core  # noqa: E402  (package import must come first)
 

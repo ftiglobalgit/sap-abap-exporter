@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
 from . import editor, includes
-from .session import SapSession
+from .session import DebuggerOpenError, SapSession
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int, str], None]
@@ -148,6 +148,16 @@ def export_program(
                 allow_clipboard=options.allow_clipboard,
                 allow_download=options.allow_download,
             )
+        except DebuggerOpenError as exc:
+            # Never keep driving the screen while a program is executing.
+            log("")
+            log("!! STOPPED - the ABAP Debugger is open.")
+            log(str(exc))
+            result.objects.append(
+                ObjectResult(name, None, 0, 0, "-", parent, depth,
+                             "aborted: ABAP Debugger open")
+            )
+            break
         except Exception as exc:
             log(f"  !! {exc}")
             result.objects.append(
@@ -163,8 +173,9 @@ def export_program(
             )
             continue
 
-        if not editor.looks_like_abap(source.text) and depth == 0:
-            log("  (warning: captured text does not look like ABAP source)")
+        if source.quality != "good":
+            log("  (warning: captured text does not look like ABAP source - "
+                "check this file before relying on it)")
 
         path, written = _write_source(folder, name, source.text, options)
         sources[name] = source.text

@@ -144,11 +144,30 @@ is logged in `_export_report.txt`, so you can always tell how a file was obtaine
 - Objects are opened in **display mode** (SE38 Display, never Change) — no enqueue
   locks are taken, so you can export while colleagues are editing, and nothing can
   be modified by accident.
+- **A control is only pressed when it identifies itself.** Navigation uses the
+  `Program → Display` menu entry, or a toolbar button whose own label/tooltip reads
+  "Display". Hardcoded button indices and blind function keys are not used.
+- **Execute-like controls are blacklisted.** Anything whose label matches
+  Execute / Run / Test / Debug / Ausführen is skipped even if it also matches
+  "Display".
+- **The ABAP Debugger halts everything.** Before and after every navigation step the
+  window title is checked; if the debugger is on screen the run aborts immediately
+  rather than pressing buttons inside a live debugging session.
+- If no identifiable Display control exists, the export **fails with an error**
+  instead of guessing.
 - Modal dialogs are handled conservatively: anything resembling *"save your
   changes?"* is answered **No**, never Yes.
-- `F8` (Execute) is never sent anywhere in the codebase — a program cannot be
-  launched by accident.
+- Blind typing is gated: the download fallback only types a path once a real
+  Windows dialog (class `#32770`) is confirmed on screen.
 - Nothing is ever written back to SAP.
+
+> #### Incident that produced these rules (v1.0.0 → v1.1.0)
+> v1.0.0 pressed `wnd[0]/tbar[1]/btn[17]` on the assumption that index 17 is
+> "Display" on the SE38 screen. On at least one system it is not: the program was
+> **executed** and stopped in the ABAP Debugger at `START-OF-SELECTION`.
+> No source was lost, but executing a program the user only wanted to *read* is a
+> serious defect. Index-based pressing has been removed entirely; see
+> `tests/test_safety.py`, which fails if it ever comes back.
 
 ---
 
@@ -236,6 +255,7 @@ Stated plainly, because you will hit some of these eventually.
 | 5 | Dynamically generated / `GENERATE SUBROUTINE POOL` code | Not discoverable from static source | Out of scope for any static exporter, including abapGit |
 | 6 | The clipboard fallback needs the SAP window in the foreground | Do not type elsewhere while it runs | Strategy 1 is used almost always and does not steal focus |
 | 7 | Very old SAP GUI with the legacy table-control editor | Slower scroll-and-harvest path | Switch to the front-end editor in `Utilities → Settings → ABAP Editor` |
+| 7b | **New ABAP editor** (`SAPGUI.AbapEditor.1`) is an embedded OCX whose `Text` property returns its ProgID, not the document | Strategy 1 cannot read it | Detected and rejected automatically; the clipboard strategy takes over. **Both "Notify when a script…" boxes must be unchecked** or the popup steals focus mid-copy |
 | 8 | Non-ASCII in comments on non-Unicode systems | Needs matching encoding | `--encoding cp1252` (default is UTF-8) |
 | 9 | Only the **active** version is exported | Inactive versions are not written | Activate first, or open the inactive version before exporting |
 | 10 | Exports **source**, not metadata | No screens, text elements, GUI statuses, DDIC | By design — see §7 if you need a complete object |
@@ -296,7 +316,7 @@ src/
     ├── exporter.py      Breadth-first traversal, file writing, report + manifest
     ├── blind.py         Scripting-free fallback
     └── winutil.py       SendInput, window focus, clipboard
-tests/                   29 tests, no SAP required
+tests/                   74 tests, no SAP required
 ```
 
 ### Tests
@@ -305,10 +325,16 @@ tests/                   29 tests, no SAP required
 python -m pytest tests -q
 ```
 
-29 tests covering the ABAP parser (chained statements, comments, string literals,
-`INCLUDE TYPE`, namespaces, circular references) and the export orchestration
-against a simulated SAP system (nested includes, missing objects, depth limits,
-customer-only filtering, stop handling, verbatim content preservation).
+74 tests covering:
+
+* **the ABAP parser** - chained statements, comments, string literals,
+  `INCLUDE TYPE`, namespaces, circular references;
+* **capture validation** - OLE ProgIDs rejected, empty documents rejected,
+  fall-through between strategies, weak captures used only as a last resort;
+* **safety** - Execute-labelled controls never chosen, unlabelled buttons never
+  pressed, debugger detection, whole-run abort when the debugger appears;
+* **export orchestration** - nested includes, missing objects, depth limits,
+  customer-only filtering, stop handling, verbatim content preservation.
 
 The COM, keystroke and clipboard layers cannot be unit-tested without a live SAP
 GUI; they are isolated in `session.py`, `editor.py` and `winutil.py` and are

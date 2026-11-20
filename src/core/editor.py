@@ -33,7 +33,13 @@ from . import winutil
 from .session import SapSession, SapGuiError, describe
 
 EDITOR_TYPES = {"GuiTextedit", "GuiTextEdit", "GuiAbapEditor"}
-EDITOR_SUBTYPES = {"TEXTEDIT", "ABAPEDIT", "TEXTEDITOR"}
+EDITOR_SUBTYPES = {"TEXTEDIT", "ABAPEDIT", "ABAPEDITOR", "TEXTEDITOR"}
+
+# A GuiShell's `Text` property returns the ProgID of the embedded OLE control
+# ("SAPGUI.AbapEditor.1", "SAPGUI.TextEdit.1", ...) - NOT the document.  The
+# new ABAP editor is such a shell, so this string must never be mistaken for
+# source code.
+PROGID_RE = re.compile(r"^[A-Za-z][\w]*(?:\.[A-Za-z][\w]*)+(?:\.\d+)?$")
 
 # Statements that always show up in real ABAP source; used as a weak sanity
 # check so that an accidentally captured empty editor is not written to disk.
@@ -55,10 +61,46 @@ class Source:
     text: str
     strategy: str
     line_count: int
+    quality: str = "good"       # "good" | "weak"
 
     @property
     def is_empty(self) -> bool:
         return not self.text.strip()
+
+
+def classify_capture(text: Optional[str]) -> Tuple[str, str]:
+    """Judge whether a captured string can possibly be ABAP source.
+
+    Returns ``(verdict, reason)`` where verdict is:
+
+    ``bad``   - certainly not source; try the next strategy
+    ``weak``  - might be a very small or comment-only include; keep as a
+                fallback but prefer anything better
+    ``good``  - looks like real ABAP
+
+    The ``bad`` case exists because of a real failure mode: reading ``.Text``
+    on the new ABAP editor's shell yields ``SAPGUI.AbapEditor.1`` - a
+    perfectly non-empty string that is not the document at all.
+    """
+    if text is None:
+        return "bad", "strategy returned nothing"
+    stripped = text.strip()
+    if not stripped:
+        return "bad", "empty document"
+
+    non_empty = [line for line in stripped.splitlines() if line.strip()]
+    if len(non_empty) == 1 and PROGID_RE.match(non_empty[0]):
+        return "bad", (
+            f"control returned its OLE ProgID ({non_empty[0]!r}) instead of the "
+            f"document - this control is not readable through its text property"
+        )
+    if len(stripped) < 8:
+        return "bad", f"only {len(stripped)} characters captured"
+    if ABAP_TOKENS.search(stripped):
+        return "good", ""
+    if len(non_empty) >= 5:
+        return "good", ""
+    return "weak", "no recognisable ABAP statements"
 
 
 # --------------------------------------------------------------------------
@@ -99,6 +141,18 @@ def find_source_table(sap: SapSession):
 
 _DISPLAY_MENU = (r"Program|Programm|Object|Objekt", r"Display|Anzeigen")
 
+# What a "Display" control calls itself, across the common logon languages.
+DISPLAY_LABEL = re.compile(
+    r"\b(display|anzeigen|afficher|visualizar|visualizza|weergeven|显示|表示)\b", re.I
+)
+
+# Anything that could START the program.  A control matching this is never
+# pressed, even if it also happens to match DISPLAY_LABEL.
+EXECUTE_LABEL = re.compile(
+    r"\b(execute|ausf[uü]hren|run|start|test|debug|debugging|exécuter|"
+    r"ejecutar|eseguire|direct\s*processing|F8)\b", re.I
+)
+
 
 def open_object(sap: SapSession, name: str, settle: float = 0.4) -> None:
     """Open an ABAP program or include in SE38 in *display* mode.
@@ -107,6 +161,7 @@ def open_object(sap: SapSession, name: str, settle: float = 0.4) -> None:
     while colleagues are editing, and nothing can be modified by accident.
     """
     sap.log(f"  opening {name} in SE38 (display)")
+    sap.assert_safe_to_navigate()
     sap.start_transaction("SE38")
 
     field = None
@@ -136,37 +191,50 @@ def open_object(sap: SapSession, name: str, settle: float = 0.4) -> None:
         except Exception:
             pass
 
-    # Press "Display".  Try the toolbar button, then the menu, then F7/F2.
+    # --------------------------------------------------------------
+    # Open in DISPLAY mode.
+    #
+    # Only two routes are allowed, and both are self-identifying:
+    #   1. the menu entry  Program > Display
+    #   2. a toolbar button whose own label/tooltip says "Display"
+    #
+    # Blind function keys and hardcoded button indices are deliberately NOT
+    # used.  An earlier version pressed tbar[1]/btn[17] assuming it was
+    # "Display"; on some systems it is not, and the program was executed into
+    # the ABAP Debugger.  If neither route is available the export stops with
+    # an error rather than pressing something unidentified.
+    # --------------------------------------------------------------
     opened = False
-    for attempt in ("btn17", "menu", "vkey7", "vkey2"):
-        if attempt == "btn17":
-            button = sap.maybe("wnd[0]/tbar[1]/btn[17]")
+    route_used = ""
+
+    for route in ("menu", "button"):
+        sap.assert_safe_to_navigate()
+
+        if route == "menu":
+            if not sap.press_menu(_DISPLAY_MENU, forbid=EXECUTE_LABEL):
+                continue
+            route_used = "menu Program > Display"
+        else:
+            button, label = sap.find_button(DISPLAY_LABEL, forbid=EXECUTE_LABEL)
             if button is None:
                 continue
             try:
                 button.press()
             except Exception:
                 continue
-        elif attempt == "menu":
-            if not sap.press_menu(_DISPLAY_MENU):
-                continue
-        elif attempt == "vkey7":
-            try:
-                sap.send_vkey(7)
-            except Exception:
-                continue
-        else:
-            try:
-                sap.send_vkey(2)
-            except Exception:
-                continue
+            route_used = f"toolbar button {label!r}"
 
         time.sleep(settle)
+        sap.assert_safe_to_navigate()
         sap.dismiss_popups()
+        sap.assert_safe_to_navigate()
+
         if find_editor(sap) is not None or find_source_table(sap) is not None:
             opened = True
+            sap.log(f"  opened via {route_used}")
             break
-        # Still on the initial screen? restore the name and try the next route.
+
+        # Still on the initial screen? restore the name and try the other route.
         if sap.maybe("wnd[0]/usr/ctxtRS38M-PROGRAMM") is not None:
             try:
                 sap.find("wnd[0]/usr/ctxtRS38M-PROGRAMM").text = name
@@ -176,8 +244,11 @@ def open_object(sap: SapSession, name: str, settle: float = 0.4) -> None:
     if not opened:
         message = sap.status_message()
         raise ExtractionError(
-            f"Could not open '{name}' in the ABAP editor."
-            + (f" SAP said: {message}" if message else "")
+            f"Could not open '{name}' in display mode.\n"
+            f"Neither the 'Program > Display' menu entry nor a toolbar button "
+            f"labelled 'Display' was found on the SE38 screen.\n"
+            f"No other key was pressed, to avoid executing the program."
+            + (f"\nSAP said: {message}" if message else "")
         )
 
 
@@ -253,26 +324,70 @@ def _read_table_control(sap: SapSession, comp) -> Optional[str]:
 # Strategy 2 - clipboard
 # --------------------------------------------------------------------------
 
-def _read_via_clipboard(sap: SapSession, comp, pause: float = 0.25) -> Optional[str]:
+def _control_rect(comp) -> Optional[Tuple[int, int, int, int]]:
+    """Screen rectangle of a control: (left, top, width, height)."""
+    try:
+        left = int(getattr(comp.obj, "ScreenLeft"))
+        top = int(getattr(comp.obj, "ScreenTop"))
+        width = int(getattr(comp.obj, "Width"))
+        height = int(getattr(comp.obj, "Height"))
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return left, top, width, height
+
+
+def _read_via_clipboard(
+    sap: SapSession, comp, pause: float = 0.3, click: bool = True
+) -> Optional[str]:
+    """Select-all + copy out of the editor control.
+
+    The new ABAP editor is an embedded OCX that keeps its own caret, and
+    ``setFocus()`` on the hosting shell does not always move it.  So the
+    control is physically clicked first - well inside its left edge, away from
+    the scrollbar - which reliably puts the caret in the document.
+    """
     hwnd = sap.hwnd
     if not winutil.bring_to_front(hwnd):
-        sap.log("  (could not raise the SAP window; clipboard copy may miss)")
+        sap.log("  (could not raise the SAP window - clipboard copy may fail)")
+
     try:
         comp.obj.setFocus()
     except Exception:
         pass
+
+    if click:
+        rect = _control_rect(comp)
+        if rect:
+            left, top, width, height = rect
+            # 35% across (clear of the line-number gutter and the scrollbar),
+            # 40% down (inside the text area even for short documents)
+            winutil.click_at(int(left + width * 0.35), int(top + height * 0.40))
+        else:
+            sap.log("  (editor geometry unavailable - clicking skipped)")
+
     time.sleep(pause)
 
-    winutil.clear_clipboard()
+    sentinel = "<<<abap-exporter-sentinel>>>"
+    try:
+        winutil.set_clipboard_text(sentinel)
+    except Exception:
+        winutil.clear_clipboard()
+
     winutil.press(winutil.VK_CONTROL, ord("A"))
     time.sleep(pause)
     winutil.press(winutil.VK_CONTROL, ord("C"))
-    time.sleep(pause + 0.2)
+    time.sleep(pause + 0.25)
 
     try:
         text = winutil.get_clipboard_text()
     except Exception as exc:
         sap.log(f"  clipboard read failed: {exc}")
+        return None
+
+    if text == sentinel:
+        sap.log("  clipboard unchanged - the copy did not reach the editor")
         return None
     return text or None
 
@@ -315,9 +430,25 @@ def _read_via_download(sap: SapSession, name: str, tmp_dir: str) -> Optional[str
         else:
             sap.send_vkey(0, "wnd[1]")
     else:
-        # Variant B: the native Windows "Save As" common dialog - type the path
-        winutil.bring_to_front(sap.hwnd)
-        time.sleep(0.4)
+        # Variant B: the native Windows "Save As" common dialog.
+        #
+        # Only type if a real dialog window (class #32770) is actually on
+        # screen.  Typing a path blindly into the SAP window would scatter
+        # text into whatever field has focus and then press Enter on it.
+        dialog = 0
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            dialog = winutil.find_dialog_window()
+            if dialog:
+                break
+            time.sleep(0.2)
+
+        if not dialog:
+            sap.log("  download dialog never appeared - skipping this strategy")
+            return None
+
+        winutil.bring_to_front(dialog)
+        time.sleep(0.3)
         winutil.type_text(target)
         time.sleep(0.2)
         winutil.press(winutil.VK_RETURN)
@@ -357,42 +488,67 @@ def extract_source(
     allow_clipboard: bool = True,
     allow_download: bool = True,
 ) -> Source:
-    """Return the full source of the object currently open in the editor."""
+    """Return the full source of the object currently open in the editor.
+
+    Every strategy's output is validated before it is accepted.  A strategy
+    that produces something that cannot be source (an empty document, an OLE
+    ProgID) is rejected and the next one is tried; only if nothing better
+    turns up is a 'weak' capture used, and then it is flagged as such.
+    """
     comp = find_editor(sap)
-    attempts: List[Tuple[str, Optional[str]]] = []
+    table = find_source_table(sap)
 
+    if comp is None and table is None:
+        raise ExtractionError(
+            f"No ABAP editor control is present on the screen for '{name}'."
+        )
+
+    plan: List[Tuple[str, callable]] = []
     if comp is not None:
-        attempts.append(("control_text", _read_control_text(comp)))
+        plan.append(("control_text", lambda: _read_control_text(comp)))
+    if table is not None:
+        plan.append(("table_control", lambda: _read_table_control(sap, table)))
+    if allow_clipboard and comp is not None:
+        plan.append(("clipboard", lambda: _read_via_clipboard(sap, comp)))
+    if allow_download:
+        plan.append(("menu_download", lambda: _read_via_download(sap, name, tmp_dir)))
 
-    if not _usable(attempts):
-        table = find_source_table(sap)
-        if table is not None:
-            attempts.append(("table_control", _read_table_control(sap, table)))
+    rejected: List[str] = []
+    weak: Optional[Source] = None
 
-    if not _usable(attempts) and allow_clipboard and comp is not None:
-        attempts.append(("clipboard", _read_via_clipboard(sap, comp)))
+    for strategy, run in plan:
+        try:
+            text = run()
+        except Exception as exc:
+            rejected.append(f"{strategy}: raised {exc}")
+            continue
 
-    if not _usable(attempts) and allow_download:
-        attempts.append(("menu_download", _read_via_download(sap, name, tmp_dir)))
+        verdict, reason = classify_capture(text)
+        if verdict == "bad":
+            rejected.append(f"{strategy}: {reason}")
+            sap.log(f"  {strategy} rejected - {reason}")
+            continue
 
-    for strategy, text in attempts:
-        if text and text.strip():
-            cleaned = _normalise(text)
-            return Source(
-                name=name,
-                text=cleaned,
-                strategy=strategy,
-                line_count=cleaned.count("\n") + 1 if cleaned else 0,
-            )
+        cleaned = _normalise(text)
+        source = Source(
+            name=name,
+            text=cleaned,
+            strategy=strategy,
+            line_count=cleaned.count("\n") + 1 if cleaned else 0,
+            quality=verdict,
+        )
+        if verdict == "good":
+            return source
+        if weak is None:
+            weak = source
+            sap.log(f"  {strategy} gave a doubtful capture ({reason}) - trying the next")
 
-    tried = ", ".join(s for s, _ in attempts) or "none"
-    raise ExtractionError(
-        f"No source text could be read for '{name}' (strategies tried: {tried})."
-    )
+    if weak is not None:
+        sap.log(f"  using the {weak.strategy} capture despite the warning")
+        return weak
 
-
-def _usable(attempts) -> bool:
-    return any(text and text.strip() for _, text in attempts)
+    detail = "; ".join(rejected) if rejected else "no strategy available"
+    raise ExtractionError(f"No source text could be read for '{name}' ({detail}).")
 
 
 def _normalise(text: str) -> str:
@@ -406,3 +562,77 @@ def _normalise(text: str) -> str:
 
 def looks_like_abap(text: str) -> bool:
     return bool(ABAP_TOKENS.search(text or ""))
+
+
+PROBE_PROPERTIES = (
+    "Type", "SubType", "Name", "Id", "Text", "OcxEvents", "DragDropSupported",
+    "ScreenLeft", "ScreenTop", "Width", "Height", "Changeable", "LineCount",
+    "NumberOfUnprotectedTextParts", "CurrentLine", "CurrentColumn",
+)
+
+PROBE_METHODS = (
+    "getNumberOfUnprotectedTextParts", "getUnprotectedTextPart",
+    "getSelectionIndexStart", "getSelectionIndexEnd", "selectAll",
+    "getLineText", "GetLineText", "setSelectionIndexes", "doubleClick",
+)
+
+
+def probe_editor(sap: SapSession) -> str:
+    """Describe the editor control on the current screen.
+
+    Written into the Diagnostics dump so an unsupported editor on any SAP
+    release can be identified without guesswork: it shows which properties
+    exist, what they return, and - critically - whether ``Text`` is the
+    document or just the control's ProgID.
+    """
+    lines = ["", "=" * 72, "ABAP EDITOR PROBE", "=" * 72]
+
+    comp = find_editor(sap)
+    table = find_source_table(sap)
+
+    if comp is None and table is None:
+        lines.append("No editor control found on the current screen.")
+        lines.append("Open a program in SE38/SE80 display mode and probe again.")
+        return "\n".join(lines)
+
+    if comp is not None:
+        lines.append(f"Editor control id : {comp.id}")
+        lines.append(f"            type  : {comp.type}")
+        lines.append(f"            subtype: {comp.subtype}")
+        lines.append("")
+        lines.append("-- properties --")
+        for prop in PROBE_PROPERTIES:
+            try:
+                value = getattr(comp.obj, prop)
+            except Exception as exc:
+                lines.append(f"  {prop:<32} <unavailable: {type(exc).__name__}>")
+                continue
+            text = repr(value)
+            if len(text) > 160:
+                text = text[:160] + f"... ({len(str(value))} chars total)"
+            lines.append(f"  {prop:<32} {text}")
+
+        lines.append("")
+        lines.append("-- methods present --")
+        for method in PROBE_METHODS:
+            lines.append(f"  {method:<36} {'yes' if hasattr(comp.obj, method) else 'no'}")
+
+        lines.append("")
+        raw = _read_control_text(comp)
+        verdict, reason = classify_capture(raw)
+        lines.append(f"-- control_text verdict: {verdict} --")
+        if reason:
+            lines.append(f"   reason: {reason}")
+        if raw:
+            preview = raw[:300].replace("\r", "")
+            lines.append(f"   first 300 chars:\n{preview}")
+
+        rect = _control_rect(comp)
+        lines.append("")
+        lines.append(f"-- screen rectangle: {rect} --")
+
+    if table is not None:
+        lines.append("")
+        lines.append(f"Legacy table-control editor present: {table.id}")
+
+    return "\n".join(lines)

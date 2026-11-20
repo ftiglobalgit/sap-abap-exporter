@@ -34,6 +34,22 @@ KEYEVENTF_UNICODE = 0x0004
 INPUT_KEYBOARD = 1
 
 
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+INPUT_MOUSE = 0
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wt.LONG),
+        ("dy", wt.LONG),
+        ("mouseData", wt.DWORD),
+        ("dwFlags", wt.DWORD),
+        ("time", wt.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(wt.ULONG)),
+    ]
+
+
 class _KEYBDINPUT(ctypes.Structure):
     _fields_ = [
         ("wVk", wt.WORD),
@@ -45,7 +61,7 @@ class _KEYBDINPUT(ctypes.Structure):
 
 
 class _INPUTunion(ctypes.Union):
-    _fields_ = [("ki", _KEYBDINPUT), ("padding", ctypes.c_byte * 32)]
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT), ("padding", ctypes.c_byte * 32)]
 
 
 class _INPUT(ctypes.Structure):
@@ -84,6 +100,42 @@ def type_text(text: str, delay: float = 0.004) -> None:
     for ch in text:
         _send([_char_input(ch), _char_input(ch, up=True)])
         time.sleep(delay)
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", wt.LONG), ("y", wt.LONG)]
+
+
+def get_cursor_pos():
+    point = _POINT()
+    user32.GetCursorPos(ctypes.byref(point))
+    return point.x, point.y
+
+
+def set_cursor_pos(x: int, y: int) -> None:
+    user32.SetCursorPos(int(x), int(y))
+
+
+def click_at(x: int, y: int, restore: bool = True, delay: float = 0.08) -> None:
+    """Left-click at a screen coordinate, then put the pointer back.
+
+    Used to place the caret inside the ABAP editor control before Ctrl+A.
+    ``setFocus()`` alone is not always enough for the new editor, which is an
+    embedded OCX that tracks its own caret.
+    """
+    origin = get_cursor_pos() if restore else None
+    set_cursor_pos(x, y)
+    time.sleep(delay)
+    down = _INPUT(type=INPUT_MOUSE, u=_INPUTunion(
+        mi=_MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, None)))
+    up = _INPUT(type=INPUT_MOUSE, u=_INPUTunion(
+        mi=_MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, None)))
+    _send([down])
+    time.sleep(0.04)
+    _send([up])
+    time.sleep(delay)
+    if origin:
+        set_cursor_pos(*origin)
 
 
 def bring_to_front(hwnd: int) -> bool:
@@ -129,6 +181,29 @@ def find_window(title_substring: str) -> int:
     return found[0] if found else 0
 
 
+def find_dialog_window(class_name: str = "#32770") -> int:
+    """Find a visible standard Windows dialog (the common Save As box).
+
+    Used to confirm a file dialog is genuinely on screen before typing a path
+    into it - blind typing would otherwise land in the SAP window.
+    """
+    found = []
+
+    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    def _cb(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        if buf.value == class_name:
+            found.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(_cb, 0)
+    return found[0] if found else 0
+
+
 def window_title(hwnd: int) -> str:
     length = user32.GetWindowTextLengthW(hwnd)
     if not length:
@@ -168,6 +243,23 @@ def get_clipboard_text(retries: int = 8, pause: float = 0.12) -> str:
     if last_err:
         raise RuntimeError(f"Could not read clipboard: {last_err}")
     return ""
+
+
+def set_clipboard_text(text: str) -> None:
+    """Write a sentinel so we can tell 'copy failed' from 'copied the same'."""
+    import win32clipboard
+
+    for _ in range(5):
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
+            finally:
+                win32clipboard.CloseClipboard()
+            return
+        except Exception:
+            time.sleep(0.1)
 
 
 def clear_clipboard() -> None:
