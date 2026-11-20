@@ -1,371 +1,187 @@
-# SAP ABAP Source Exporter
+﻿================================================================================
+            SAP ABAP SOURCE EXPORTER - HƯỚNG DẪN SỬ DỤNG
+================================================================================
 
-Export an ABAP program **and every include it pulls in** from your running SAP GUI
-session into separate `.txt` files — one click, no copy-paste, no RFC.
+Công cụ xuất toàn bộ source code ABAP (chương trình chính + tất cả include)
+ra các file .txt riêng biệt, đọc trực tiếp từ màn hình SAP GUI đang mở.
 
-```
-ZMM_CREATEPO/
-├── ZMM_CREATEPO.txt
-├── ZMM_CREATEPO_TOP.txt
-├── ZMM_CREATEPO_F01.txt
-├── ZMM_CREATEPO_O01.txt
-├── ZMM_CREATEPO_I01.txt
-├── _export_report.txt        (what was exported, how, how many lines)
-└── _export_manifest.json
-```
+Không dùng RFC. Không cài đặt gì trên hệ thống SAP.
 
----
 
-## 1. Read this first: how "screen-based" is implemented, and why
+================================================================================
+1. YÊU CẦU TRƯỚC KHI CHẠY
+================================================================================
 
-You asked for screen-based extraction and explicitly excluded RFC. That is the right
-call, and it is achievable — but *how* matters, so here is the honest engineering
-picture before anything else.
+  [1] SAP GUI đang mở và ĐÃ ĐĂNG NHẬP vào hệ thống cần lấy source.
+      (Công cụ dùng lại phiên đăng nhập sẵn có của bạn)
 
-### Pixel OCR is not a viable way to read source code
+  [2] Đã bật Scripting trong SAP GUI  -> xem Mục 2
 
-Reading the editor as an image (screenshot → OCR) fails on source code for reasons
-that cannot be engineered away:
+  [3] Chương trình cần export KHÔNG CÒN BREAKPOINT  -> xem Mục 3
 
-| Problem | Consequence |
-|---|---|
-| `l` / `1` / `I`, `0` / `O`, `.` / `,` are near-identical in SAP's editor font | Silent corruption inside identifiers and literals |
-| Leading whitespace is not reliably recoverable | ABAP indentation destroyed |
-| Only ~40 lines are visible at a time | Needs scroll-stitching, which drifts and duplicates/loses lines |
-| No checksum or line count to verify against | You cannot tell a correct export from a corrupt one |
+  [4] Không chạy file .exe bằng "Run as Administrator"
+      nếu SAP Logon chạy ở quyền thường.
+      (Hai ứng dụng khác quyền sẽ không "nhìn thấy" nhau)
 
-A source export that is 99.5% correct is worse than useless — you would not know
-which 0.5% is wrong. So OCR is **not** used.
 
-### What is used instead: the SAP GUI Scripting object model
+================================================================================
+2. CÀI ĐẶT SAP GUI (LÀM 1 LẦN DUY NHẤT)
+================================================================================
 
-SAP GUI exposes its **own live screen** as a COM object tree (`SAPGUI` running
-object → `GetScriptingEngine`). Every control physically on your screen — fields,
-trees, menus, the ABAP editor — is addressable, with its exact text.
+  Mở SAP Logon  ->  nút menu góc trên bên trái  ->  Options...
+  Vào mục:  Accessibility & Scripting  ->  Scripting
 
-This satisfies every constraint you set:
+  Thiết lập đúng như sau:
 
-| Your requirement | Status |
-|---|---|
-| Screen-based / GUI automation | ✅ Reads the actual on-screen control tree |
-| No RFC, no SAP RFC SDK | ✅ Zero network protocol involvement; pure client-side COM |
-| No backend programs or modifications | ✅ Nothing installed or transported into SAP |
-| Uses the existing authenticated session | ✅ Attaches to the session you are already logged into |
-| Keyboard / mouse / clipboard automation | ✅ Used as fallback strategies (below) |
-| Must not assume source fits on one screen | ✅ The editor control holds the whole document in memory — scrolling is irrelevant |
+      [x] Enable scripting                               <- TICK
+      [ ] Notify when a script attaches to SAP GUI       <- BỎ TICK
+      [ ] Notify when a script opens a connection        <- BỎ TICK
+      [ ] Show native Microsoft Windows dialogs          <- BỎ TICK
 
-**SAP GUI Scripting is not RFC.** It is the same client-side automation layer behind
-SAP's own script recorder (`Alt+F12 → Script Recording and Playback`). No
-`sapnwrfc.dll`, no `pyrfc`, no service user, no function module.
-
-### The one real prerequisite
-
-Scripting must be switched on. It is off by default in some landscapes:
-
-**Client side** — SAP Logon → `Options` → `Accessibility & Scripting` → `Scripting`:
-- ☑ Enable scripting
-- ☐ Notify when a script attaches to SAP GUI *(uncheck)*
-- ☐ Notify when a script opens a connection *(uncheck)*
-
-**Server side** — profile parameter `sapgui/user_scripting = TRUE` (Basis, via `RZ11`).
-Read-only scripting is enough; this tool never writes to SAP.
-
-If your Basis team will not enable it, see §6 — a scripting-free fallback mode ships
-with the tool, and §7 lists the alternatives.
-
----
-
-## 2. How the extraction works
-
-### Finding the program you selected
-
-No typing. The app reads the live screen and scores several independent signals,
-most-trusted first:
-
-1. The SE38 program field (`RS38M-PROGRAMM`) — you typed it, so it is unambiguous
-2. **The selected node of the SE80 repository-browser tree** — the most direct
-   expression of "the program I picked"
-3. Other fields whose technical name carries a program (`RSEUX-OBJECT_NAME`, …)
-4. The window caption — `ABAP Editor: Change Report ZMM_CREATEPO`
-5. Screen headers
-
-Captions that name a *screen* rather than an object ("Object Navigator", "ABAP
-Workbench", "SAP Easy Access") are ignored outright, and `object` is not treated as
-a title keyword — SE80's own caption is "Object Navigator", which once parsed as
-object=`NAVIGATOR` and outranked the correct answer. Customer namespaces (`Z*`,
-`Y*`, `/ns/`) get a small tie-break bonus. When the top two candidates score within
-10 points the app says so and asks you to confirm.
-
-The highest-scoring candidate is shown in the app **with its evidence**, so you can
-see *why* it was chosen. If you had an include selected (say `ZMM_CREATEPO_TOP`),
-the naming convention is recognised and the main program `ZMM_CREATEPO` is proposed
-instead. You can always overtype it.
-
-### Finding the includes
-
-Two complementary sources, merged:
-
-**A. Source parsing (primary).** The main program's text is parsed for `INCLUDE`
-statements; each include found is opened and parsed in turn, breadth-first, to any
-nesting depth. This mirrors exactly how the ABAP compiler assembles a program.
-
-The parser is not a naive regex — it correctly handles:
-
-- chained statements — `INCLUDE: ztop, zf01, zo01.` ← *this is what your screenshot uses*
-- `INCLUDE zfoo IF FOUND.`
-- `*` full-line comments and `"` trailing comments
-- the word `INCLUDE` appearing inside a string literal
-- `INCLUDE TYPE ty.` / `INCLUDE STRUCTURE st.` inside `TYPES BEGIN OF` blocks — these are
-  **not** source includes and are skipped
-- system includes such as `<ICON>`
-- `/NAMESPACE/` names
-- circular and duplicate references
-
-**B. The SE80 object tree (secondary).** The `Includes` folder in the repository
-browser — the one in your screenshot — is expanded through the `GuiTree` API and its
-children are read. This catches includes registered against the program that no
-parsed `INCLUDE` statement reached.
-
-### Getting the source text — three strategies, in order
-
-The source is read in whole, never a visible page at a time:
-
-1. **`control_text`** — read the `text` property of the ABAP editor control.
-   The control holds the **entire** document regardless of scroll position. Fast,
-   exact, does not steal focus. *Used in the vast majority of cases.*
-2. **`clipboard`** — focus the editor control via scripting, `Ctrl+A`, `Ctrl+C`,
-   read the Windows clipboard. `Ctrl+A` selects the whole document, so again
-   scrolling and file size are irrelevant. Covers the old editor, the new front-end
-   editor, and read-only display mode.
-3. **`menu_download`** — drive `Utilities → More Utilities → Upload/Download →
-   Download` and let SAP itself write the file out. Slowest, but immune to the
-   other two failing.
-
-There is also a scroll-and-harvest reader for the legacy table-control editor, the
-one editor that genuinely only holds the visible page.
-
-If **all** strategies fail for an object, that object is recorded as failed in the
-report — a truncated file is never written. Which strategy was used for each object
-is logged in `_export_report.txt`, so you can always tell how a file was obtained.
-
-### Safety properties
-
-- Objects are opened in **display mode** (SE38 Display, never Change) — no enqueue
-  locks are taken, so you can export while colleagues are editing, and nothing can
-  be modified by accident.
-- **A control is only pressed when it identifies itself.** Navigation uses the
-  `Program → Display` menu entry, or a toolbar button whose own label/tooltip reads
-  "Display". Hardcoded button indices and blind function keys are not used.
-- **Execute-like controls are blacklisted.** Anything whose label matches
-  Execute / Run / Test / Debug / Ausführen is skipped even if it also matches
-  "Display".
-- **The ABAP Debugger halts everything.** Before and after every navigation step the
-  window title is checked; if the debugger is on screen the run aborts immediately
-  rather than pressing buttons inside a live debugging session.
-- If no identifiable Display control exists, the export **fails with an error**
-  instead of guessing.
-- Modal dialogs are handled conservatively: anything resembling *"save your
-  changes?"* is answered **No**, never Yes.
-- Blind typing is gated: the download fallback only types a path once a real
-  Windows dialog (class `#32770`) is confirmed on screen.
-- Nothing is ever written back to SAP.
-
-> #### Incident that produced these rules (v1.0.0 → v1.1.0)
-> v1.0.0 pressed `wnd[0]/tbar[1]/btn[17]` on the assumption that index 17 is
-> "Display" on the SE38 screen. On at least one system it is not: the program was
-> **executed** and stopped in the ABAP Debugger at `START-OF-SELECTION`.
-> No source was lost, but executing a program the user only wanted to *read* is a
-> serious defect. Index-based pressing has been removed entirely; see
-> `tests/test_safety.py`, which fails if it ever comes back.
-
----
-
-## 3. Installing and building the `.exe`
-
-Requirements: Windows, Python 3.10+, SAP GUI for Windows 7.40+.
-
-```bat
-git clone <this repo>
-cd sap-abap-exporter
-build.bat
-```
-
-`build.bat` creates a virtual environment, installs dependencies, runs the test
-suite and produces:
-
-```
-dist\sap-abap-exporter.exe
-```
-
-A single self-contained file (~12 MB). Copy it anywhere; it needs no installer and
-no admin rights.
-
-> **Note:** a Windows `.exe` can only be produced on Windows — PyInstaller does not
-> cross-compile. If you have no Python on your machine, push the repo to GitHub and
-> the included workflow (`.github/workflows/build-windows.yml`) builds the `.exe` for
-> you on a hosted Windows runner and publishes it as a downloadable artifact.
-
-Run from source instead, if you prefer:
-
-```bat
-pip install -r requirements.txt
-python src\main.py
-```
-
----
-
-## 4. Using it
-
-1. In SAP GUI, open your program in **SE80** (or SE38) — exactly as in your screenshot.
-2. Start `sap-abap-exporter.exe`.
-3. The SAP session is listed automatically. Click **Detect from SAP** → `ZMM_CREATEPO` appears.
-4. Pick an output folder.
-5. Click **Export source**.
-
-The log shows each object as it is processed; the folder appears with one `.txt`
-per object, named exactly as the SAP object.
-
-### Command line
-
-Useful for scheduled or batch exports:
-
-```bat
-sap-abap-exporter.exe --cli                                   ;; export whatever is selected
-sap-abap-exporter.exe --cli --program ZMM_CREATEPO --out D:\src
-sap-abap-exporter.exe --cli --customer-only                   ;; skip SAP standard includes
-sap-abap-exporter.exe --cli --list-sessions
-sap-abap-exporter.exe --cli --dump-tree diag.txt              ;; diagnostics
-sap-abap-exporter.exe --cli --blind                           ;; no-scripting fallback
-```
-
-| Option | Meaning |
-|---|---|
-| `--program` / `-p` | Program name; omit to auto-detect |
-| `--out` / `-o` | Output root (default `%USERPROFILE%\Documents\ABAP_Export`) |
-| `--customer-only` | Only `Z*`, `Y*`, `/namespace/` objects |
-| `--no-se80-tree` | Rely on source parsing alone |
-| `--no-clipboard` / `--no-download` | Disable a fallback strategy |
-| `--max-depth` | Include nesting limit (default 10) |
-| `--encoding`, `--lf` | Output encoding; Unix line endings |
-| `--connection`, `--session` | Pick among multiple SAP sessions |
-
----
-
-## 5. Known limitations
-
-Stated plainly, because you will hit some of these eventually.
-
-| # | Limitation | Effect | Mitigation |
-|---|---|---|---|
-| 1 | Scripting may be disabled client- or server-side | Tool cannot attach at all | §1 setup, or `--blind` mode, or §7 alternatives |
-| 2 | Some landscapes force a *"a script is opening a connection"* popup | Needs one click per run | Clear the two notify checkboxes in SAP Logon options |
-| 3 | **Class pools** (`CL_*`, SE24) are not include-based | Local class sections (CCDEF/CCIMP/CCMAC/CCAU) are not discovered | Scope is reports, module pools and function groups. Export class sources via SE80 → Download, or extend `editor.open_object` to use SE24 |
-| 4 | Generated includes with no `INCLUDE` statement (certain function-group and enhancement includes) | Could be missed by parsing alone | Covered by the SE80 tree reader (option B); leave it enabled |
-| 5 | Dynamically generated / `GENERATE SUBROUTINE POOL` code | Not discoverable from static source | Out of scope for any static exporter, including abapGit |
-| 6 | The clipboard fallback needs the SAP window in the foreground | Do not type elsewhere while it runs | Strategy 1 is used almost always and does not steal focus |
-| 7 | Very old SAP GUI with the legacy table-control editor | Slower scroll-and-harvest path | Switch to the front-end editor in `Utilities → Settings → ABAP Editor` |
-| 7b | **New ABAP editor** (`SAPGUI.AbapEditor.1`) is an embedded OCX whose `Text` property returns its ProgID, not the document | Strategy 1 cannot read it | Detected and rejected automatically; the clipboard strategy takes over. **Both "Notify when a script…" boxes must be unchecked** or the popup steals focus mid-copy |
-| 8 | Non-ASCII in comments on non-Unicode systems | Needs matching encoding | `--encoding cp1252` (default is UTF-8) |
-| 9 | Only the **active** version is exported | Inactive versions are not written | Activate first, or open the inactive version before exporting |
-| 10 | Exports **source**, not metadata | No screens, text elements, GUI statuses, DDIC | By design — see §7 if you need a complete object |
-
-**Not a limitation:** source longer than the screen. Strategies 1 and 2 both return
-the entire document irrespective of scroll state. This was a design requirement.
-
----
-
-## 6. `--blind` mode (when scripting is refused)
-
-A COM-free fallback: finds the SAP window by caption, injects keystrokes with
-`SendInput`, retrieves source via the clipboard, and navigates with the command
-field (`Ctrl+/` → `/nSE38` → name → `F7`).
-
-It is **less reliable by construction** and says so at startup:
-
-- the program name can only be read from the window caption;
-- navigation assumes `F7` = Display on the SE38 initial screen;
-- every step is verified against the caption, and when verification fails the run
-  **stops and asks you** rather than pressing unknown keys — `F8` is never sent;
-- you must not use the keyboard or mouse while it runs.
-
-Use it to get unblocked, not as the standard path.
-
----
-
-## 7. Alternatives, if this approach is blocked
-
-Ranked by how well they fit your stated constraints:
-
-1. **Ask Basis for read-only scripting** (`sapgui/user_scripting = TRUE`). Usually
-   approved: it grants a script nothing the logged-on user cannot already do by hand.
-2. **abapGit** — the ABAP community standard. Exports complete objects (source *and*
-   metadata) to files or Git. Needs a one-time report installed in the system, which
-   your constraints exclude, but it is the correct long-term answer for source control.
-3. **ADT / Eclipse + ABAP Development Tools** — select a program, `Export → File system`.
-   No GUI automation needed, but it does use an HTTP/ADT connection, not SAP GUI.
-4. **SE38 `Utilities → More Utilities → Upload/Download → Download`**, run manually per
-   object. Exactly what strategy 3 automates — reliable, but it is the copy-paste
-   drudgery you asked to remove.
-5. **RFC / `pyrfc` with `RPY_PROGRAM_READ`** — technically the cleanest and most robust
-   route. Excluded by your requirements; noted only for completeness.
-
----
-
-## 8. Project layout
-
-```
-src/
-├── main.py              CLI + entry point
-├── app_gui.py           Tkinter front-end
-└── core/
-    ├── session.py       COM attach, component-tree walk, popups, navigation, menus
-    ├── detect.py        Identify the selected program from the live screen
-    ├── editor.py        Open objects; three extraction strategies
-    ├── includes.py      ABAP comment/statement/INCLUDE parser; SE80 tree reader
-    ├── exporter.py      Breadth-first traversal, file writing, report + manifest
-    ├── blind.py         Scripting-free fallback
-    └── winutil.py       SendInput, window focus, clipboard
-tests/                   97 tests, no SAP required
-```
-
-### Tests
-
-```bat
-python -m pytest tests -q
-```
-
-97 tests covering:
-
-* **the ABAP parser** - chained statements, comments, string literals,
-  `INCLUDE TYPE`, namespaces, circular references;
-* **capture validation** - OLE ProgIDs rejected, empty documents rejected,
-  fall-through between strategies, weak captures used only as a last resort;
-* **safety** - Execute-labelled controls never chosen, unlabelled buttons never
-  pressed, debugger detection, whole-run abort when the debugger appears;
-* **program detection** - generic screen captions ignored, tree selection
-  outranking the window title, include-to-main-program mapping;
-* **export orchestration** - nested includes, missing objects, depth limits,
-  customer-only filtering, stop handling, verbatim content preservation.
-
-The COM, keystroke and clipboard layers cannot be unit-tested without a live SAP
-GUI; they are isolated in `session.py`, `editor.py` and `winutil.py` and are
-exercised by the `Diagnostics` button (see below).
-
----
-
-## 9. Troubleshooting
-
-| Symptom | Cause / fix |
-|---|---|
-| *"No running SAP GUI found"* | SAP Logon is not running, or the app runs elevated and SAP does not (COM cannot cross integrity levels — run both the same way) |
-| *"scripting engine is not reachable"* | Scripting disabled — §1 |
-| *"you are not logged on to any system"* | Connection open but no session; log on |
-| Detection picks the wrong name | Overtype it — it is just a pre-filled suggestion |
-| An include fails on your release | Press **Diagnostics** — it dumps the whole GUI component tree to a text file showing exact control ids for *your* SAP version. That file is all that is needed to adapt `editor.find_editor` or `editor.open_object` |
-| Export is slow | Each object is a GUI round-trip, ~0.5–1 s. 40 includes ≈ 30 s. Strategy 1 is the fast path; `menu_download` is much slower |
-
----
-
-## 10. Licence
-
-MIT. Provided as-is; verify exports before relying on them for anything regulated.
+  Bấm Apply -> OK.
+
+  *** QUAN TRỌNG ***
+  Hai ô "Notify when..." BẮT BUỘC phải bỏ tick.
+  Nếu còn bật, popup cảnh báo sẽ hiện lên và cướp focus khỏi editor
+  giữa lúc công cụ đang copy source  ->  export sẽ bị lỗi hoặc thiếu.
+
+  Nếu sau khi bật vẫn báo lỗi "scripting engine is not reachable":
+  nhờ team Basis set tham số hệ thống:   sapgui/user_scripting = TRUE
+  (Chỉ cần quyền đọc, không ảnh hưởng bảo mật)
+
+
+================================================================================
+3. XÓA BREAKPOINT TRƯỚC KHI EXPORT
+================================================================================
+
+  Nếu chương trình còn breakpoint, SAP có thể nhảy vào màn hình Debugger
+  và công cụ sẽ DỪNG LẠI ngay lập tức (để an toàn).
+
+  Cách xóa:  vào SE38 / SE80  ->  menu  Utilities  ->  Breakpoints
+             ->  Delete  ->  All
+
+  Lưu ý: Công cụ luôn mở chương trình ở chế độ DISPLAY (chỉ xem),
+  không bao giờ sửa, không khóa object, không chạy chương trình.
+
+
+================================================================================
+4. CÁC BƯỚC EXPORT SOURCE
+================================================================================
+
+  BƯỚC 1 - Trên SAP GUI:
+           Mở SE80 (hoặc SE38) và chọn chương trình cần lấy source.
+           Ví dụ: ZMM_CREATEPO
+
+  BƯỚC 2 - Mở file:  sap-abap-exporter.exe
+           Lần đầu Windows báo "Windows protected your PC"
+           ->  bấm "More info"  ->  "Run anyway"
+
+  BƯỚC 3 - Ở mục "SAP session":
+           Chọn đúng phiên SAP đang làm việc.
+           (Nếu chưa thấy, bấm nút "Refresh")
+
+  BƯỚC 4 - Bấm nút "Detect from SAP"
+           Tên chương trình sẽ tự động hiện ra ở ô "Program".
+           ->  KIỂM TRA LẠI tên có đúng không, nếu sai thì gõ tay.
+
+  BƯỚC 5 - Bấm "Browse..." để chọn thư mục lưu kết quả.
+
+  BƯỚC 6 - Bấm "Export source" và CHỜ.
+
+           *** TRONG LÚC CHẠY: KHÔNG dùng chuột và bàn phím,
+               KHÔNG chuyển qua cửa sổ khác. ***
+               Công cụ cần giữ focus trên cửa sổ SAP để copy source.
+
+  BƯỚC 7 - Xong, bấm "Open folder" để mở thư mục kết quả.
+
+
+================================================================================
+5. KẾT QUẢ NHẬN ĐƯỢC
+================================================================================
+
+  Công cụ tự tạo 1 thư mục trùng tên chương trình chính:
+
+      ZMM_CREATEPO\
+          ZMM_CREATEPO.txt            <- chương trình chính
+          ZMM_CREATEPO_TOP.txt        <- các include
+          ZMM_CREATEPO_F01.txt
+          ZMM_CREATEPO_O01.txt
+          ZMM_CREATEPO_I01.txt
+          _export_report.txt          <- báo cáo: lấy được gì, bao nhiêu dòng
+          _export_manifest.json
+
+  Mỗi object = 1 file .txt riêng, giữ nguyên tên gốc trên SAP
+  và giữ nguyên định dạng source code (thụt dòng, comment...).
+
+  ** NÊN KIỂM TRA FILE  _export_report.txt  SAU MỖI LẦN CHẠY **
+  File này liệt kê: object nào lấy thành công, bao nhiêu dòng,
+  và object nào bị lỗi (nếu có).
+
+
+================================================================================
+6. TÙY CHỌN (OPTIONS)
+================================================================================
+
+  Only customer objects (Z*, Y*, /namespace/)
+      Chỉ lấy include của khách hàng, bỏ qua include chuẩn của SAP.
+      -> Tick vào nếu chỉ cần code custom, sẽ chạy nhanh hơn.
+
+  Also read the SE80 'Includes' tree
+      Đọc thêm danh sách include từ cây thư mục SE80.
+      -> Nên để mặc định (có tick) cho đầy đủ.
+
+  Write export report
+      Tạo file báo cáo _export_report.txt.  -> Nên để có tick.
+
+  Allow clipboard fallback
+      *** BẮT BUỘC TICK ***
+      Với ABAP Editor mới, đây là cách duy nhất đọc được source.
+
+  Allow SAP download fallback
+      Phương án dự phòng cuối cùng.  -> Nên để có tick.
+
+
+================================================================================
+7. LỖI THƯỜNG GẶP
+================================================================================
+
+  "No running SAP GUI found"
+      -> Chưa mở SAP Logon, hoặc file .exe đang chạy quyền Administrator
+         còn SAP thì không (hoặc ngược lại). Chạy cả hai cùng quyền.
+
+  "SAP GUI is running but the scripting engine is not reachable"
+      -> Chưa bật Enable scripting. Xem lại Mục 2.
+         Nếu bật rồi vẫn lỗi -> nhờ Basis set sapgui/user_scripting = TRUE
+
+  "The ABAP Debugger is open"
+      -> Chương trình đang chạy trong Debugger.
+         Thoát Debugger bằng  Debugger > Exit  (hoặc Shift+F3).
+         KHÔNG bấm F8 (sẽ chạy tiếp chương trình).
+         Sau đó xóa breakpoint theo Mục 3 rồi chạy lại.
+
+  Tên chương trình detect sai
+      -> Gõ tay tên đúng vào ô "Program" rồi bấm "Export source".
+         Không cần bấm "Detect from SAP" lại.
+
+  File .txt chỉ có 1 dòng là "SAPGUI.AbapEditor.1"
+      -> Bạn đang dùng bản cũ (v1.0.0). Cập nhật lên bản mới nhất.
+
+  Export bị thiếu dòng / file rỗng
+      -> Do bị mất focus giữa chừng.
+         Kiểm tra đã bỏ tick 2 ô "Notify when..." chưa (Mục 2),
+         và không dùng chuột/bàn phím trong lúc chạy.
+
+
+================================================================================
+8. LƯU Ý AN TOÀN
+================================================================================
+
+  - Công cụ CHỈ ĐỌC, không bao giờ ghi ngược lên hệ thống SAP.
+  - Luôn mở object ở chế độ Display -> không khóa object,
+    đồng nghiệp vẫn sửa bình thường trong lúc bạn export.
+  - Không bao giờ bấm nút "Execute" hay phím F8.
+  - Nếu phát hiện màn hình Debugger, công cụ dừng lại ngay,
+    không thao tác tiếp trên màn hình đang chạy chương trình.
+  - Hộp thoại hỏi "Save changes?" luôn được trả lời "No".
+
+================================================================================
