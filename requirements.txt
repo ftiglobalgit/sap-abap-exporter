@@ -1,0 +1,5 @@
+# Runtime (Windows only)
+pywin32>=306        # COM access to the SAP GUI Scripting engine + clipboard
+
+# Build
+pyinstaller>=6.3
