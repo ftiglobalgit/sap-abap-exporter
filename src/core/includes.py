@@ -189,41 +189,68 @@ def parse_includes(source: str) -> List[str]:
 
 _INCLUDE_FOLDER = re.compile(r"^(includes?|includes\s*\(\d+\)|include-programme?)$", re.I)
 
+# Other folders in the SE80 object tree that the exporter navigates
+_IMPL_CLASS_FOLDER = re.compile(
+    r"^(implementing\s+classes?|implementierende\s+klassen?)(\s*\(\d+\))?$", re.I
+)
+_METHODS_FOLDER = re.compile(r"^(methods?|methoden)(\s*\(\d+\))?$", re.I)
+_REDEF_FOLDER = re.compile(r"^(redefinitions?|redefinitionen)(\s*\(\d+\))?$", re.I)
 
-def includes_from_se80_tree(sap: SapSession, program: str) -> List[str]:
-    """Expand the "Includes" folder in the SE80 repository browser and read
-    its children.  Best effort - returns [] if SE80 is not open or the tree
-    cannot be driven on this release."""
-    names: List[str] = []
-    tree_comp = None
+
+def find_tree(sap: SapSession):
+    """The repository browser tree on the current screen, or None."""
     for comp in sap.walk("wnd[0]"):
         if comp.type == "GuiTree" or "tree" in (comp.subtype or "").lower():
-            tree_comp = comp
-            break
-    if tree_comp is None:
-        return names
+            return comp.obj
+    return None
 
-    tree = tree_comp.obj
+
+def _collection(col) -> List[str]:
+    """SAP collections expose ElementAt on some releases and Item on others."""
     try:
-        keys = tree.GetAllNodeKeys()
-        key_list = [keys.ElementAt(i) for i in range(int(keys.Count))]
+        count = int(col.Count)
     except Exception:
-        try:
-            key_list = [keys.Item(i) for i in range(int(keys.Count))]
-        except Exception:
-            return names
+        return []
+    out: List[str] = []
+    for i in range(count):
+        for getter in ("ElementAt", "Item"):
+            try:
+                out.append(getattr(col, getter)(i))
+                break
+            except Exception:
+                continue
+    return out
+
+
+def tree_folder_children(
+    sap: SapSession, folder_pattern, exclude: str = ""
+) -> List[str]:
+    """Expand the first tree folder matching *folder_pattern* and read the
+    first word of each child node.
+
+    "Includes", "Implementing Classes", "Methods" and "Redefinitions" are all
+    just folders in the same tree, so one reader serves all of them.
+    """
+    tree = find_tree(sap)
+    if tree is None:
+        return []
+
+    try:
+        keys = _collection(tree.GetAllNodeKeys())
+    except Exception:
+        return []
 
     folder_key = None
-    for key in key_list:
+    for key in keys:
         try:
             text = str(tree.GetNodeTextByKey(key)).strip()
         except Exception:
             continue
-        if _INCLUDE_FOLDER.match(text):
+        if folder_pattern.match(text):
             folder_key = key
             break
     if folder_key is None:
-        return names
+        return []
 
     try:
         tree.expandNode(folder_key)
@@ -231,20 +258,43 @@ def includes_from_se80_tree(sap: SapSession, program: str) -> List[str]:
         pass
 
     try:
-        children = tree.GetSubNodesCol(folder_key)
-        child_keys = [children.ElementAt(i) for i in range(int(children.Count))]
+        child_keys = _collection(tree.GetSubNodesCol(folder_key))
     except Exception:
-        return names
+        return []
 
+    names: List[str] = []
+    skip = (exclude or "").upper()
     for key in child_keys:
         try:
             text = str(tree.GetNodeTextByKey(key)).strip().upper()
         except Exception:
             continue
-        text = text.split()[0] if text else ""
-        if text and NAME_RE.match(text) and text != program.upper():
-            names.append(text)
+        first = text.split()[0] if text else ""
+        if first and NAME_RE.match(first) and first != skip and first not in names:
+            names.append(first)
     return names
+
+
+def includes_from_se80_tree(sap: SapSession, program: str) -> List[str]:
+    """Expand the "Includes" folder in the SE80 repository browser and read
+    its children.  Best effort - returns [] if SE80 is not open or the tree
+    cannot be driven on this release."""
+    return tree_folder_children(sap, _INCLUDE_FOLDER, exclude=program)
+
+
+def implementing_classes_from_tree(sap: SapSession, interface: str) -> List[str]:
+    """Children of the "Implementing Classes" folder of an interface."""
+    return tree_folder_children(sap, _IMPL_CLASS_FOLDER, exclude=interface)
+
+
+def methods_from_tree(sap: SapSession, owner: str = "") -> List[str]:
+    """Children of the "Methods" folder of a class or interface."""
+    return tree_folder_children(sap, _METHODS_FOLDER, exclude=owner)
+
+
+def redefinitions_from_tree(sap: SapSession, owner: str = "") -> List[str]:
+    """Children of the "Redefinitions" folder of a class."""
+    return tree_folder_children(sap, _REDEF_FOLDER, exclude=owner)
 
 
 # --------------------------------------------------------------------------

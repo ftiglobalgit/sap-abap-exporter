@@ -20,6 +20,7 @@ from tkinter import ttk, scrolledtext
 from core import VERSION
 from core.detect import detect_program, strip_to_main_program
 from core.exporter import ExportOptions, export_program
+from core.objects import Kind
 from core.session import SapGuiError, SapSession, ScriptingDisabledError
 
 DEFAULT_OUTPUT = os.path.join(os.path.expanduser("~"), "Documents", "ABAP_Export")
@@ -45,6 +46,9 @@ class ExporterApp:
         self.var_report = BooleanVar(value=True)
         self.var_clipboard = BooleanVar(value=True)
         self.var_download = BooleanVar(value=True)
+        self.var_kind = StringVar(value="Auto-detect")
+        self.var_split = BooleanVar(value=True)
+        self.var_redef = BooleanVar(value=False)
 
         self._build()
         self.root.after(120, self._pump)
@@ -99,7 +103,19 @@ class ExporterApp:
         ttk.Checkbutton(opts, text="Allow SAP download fallback",
                         variable=self.var_download).grid(row=2, column=0, sticky="w", padx=4)
 
-        row += 1
+        cls = ttk.LabelFrame(main, text="Classes / interfaces", padding=8)
+        cls.grid(row=row + 1, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 8))
+        ttk.Label(cls, text="Object type").grid(row=0, column=0, sticky="w", padx=4)
+        ttk.Combobox(cls, textvariable=self.var_kind, state="readonly", width=18,
+                     values=["Auto-detect", "Program / Include", "Class",
+                             "Interface", "Business object"]
+                     ).grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Checkbutton(cls, text="One file per method",
+                        variable=self.var_split).grid(row=0, column=2, sticky="w", padx=12)
+        ttk.Checkbutton(cls, text="Only redefined methods",
+                        variable=self.var_redef).grid(row=0, column=3, sticky="w", padx=4)
+
+        row += 2
         buttons = ttk.Frame(main)
         buttons.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8)
         self.btn_export = ttk.Button(buttons, text="Export source", command=self.start_export)
@@ -145,6 +161,11 @@ class ExporterApp:
                     self.var_status.set(payload)
                 elif kind == "program":
                     self.var_program.set(payload)
+                elif kind == "kind":
+                    for label, value in self.KIND_CHOICES.items():
+                        if value == payload:
+                            self.var_kind.set(label)
+                            break
                 elif kind == "sessions":
                     self.combo_session["values"] = payload
                     if payload and not self.var_session.get():
@@ -164,6 +185,17 @@ class ExporterApp:
         except queue.Empty:
             pass
         self.root.after(120, self._pump)
+
+    KIND_CHOICES = {
+        "Auto-detect": None,
+        "Program / Include": Kind.PROGRAM,
+        "Class": Kind.CLASS,
+        "Interface": Kind.INTERFACE,
+        "Business object": Kind.BUSINESS_OBJECT,
+    }
+
+    def _selected_kind(self):
+        return self.KIND_CHOICES.get(self.var_kind.get())
 
     def _session_indices(self):
         raw = self.var_session.get()
@@ -251,7 +283,9 @@ class ExporterApp:
                         f"'{suggestion}' - using the main program.",
                     )
                 self._post("program", suggestion)
-                self._post("log", f"Detected program: {suggestion}")
+                self._post("kind", detection.kind)
+                self._post("log",
+                           f"Detected {detection.kind.value}: {suggestion}")
             else:
                 self._post("log",
                            "Could not detect a program. Open the program in SE80/SE38 "
@@ -311,6 +345,9 @@ class ExporterApp:
 
         options = ExportOptions(
             output_root=output,
+            split_methods=self.var_split.get(),
+            only_redefinitions=self.var_redef.get(),
+            root_kind=self._selected_kind(),
             customer_only=self.var_customer_only.get(),
             use_se80_tree=self.var_use_tree.get(),
             write_report=self.var_report.get(),

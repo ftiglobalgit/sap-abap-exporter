@@ -29,7 +29,8 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from . import winutil
+from . import includes, objects, winutil
+from .objects import Kind
 from .session import SapSession, SapGuiError, describe
 
 EDITOR_TYPES = {"GuiTextedit", "GuiTextEdit", "GuiAbapEditor"}
@@ -154,7 +155,265 @@ EXECUTE_LABEL = re.compile(
 )
 
 
-def open_object(sap: SapSession, name: str, settle: float = 0.4) -> None:
+@dataclass
+class Opened:
+    """What actually ended up on screen after a navigation request."""
+
+    name: str                 # the object whose source is now displayed
+    kind: Kind
+    note: str = ""            # e.g. "implementing class of ZII_..."
+    source_based: bool = False
+
+
+# Class Builder's whole-class view.  Switching to it means one capture
+# returns every section and every method body, instead of navigating to each
+# method separately.
+SOURCE_BASED_LABEL = re.compile(
+    r"source\s*code[\s-]*based|quellcode[\s-]*basiert|source\s*code\s*view", re.I
+)
+_SOURCE_BASED_MENU = (
+    r"Goto|Springen|Utilities.*|Hilfsmittel.*",
+    r".*Source\s*Code[\s-]*Based.*|.*Quellcode.*",
+)
+
+_SE24_DISPLAY_MENU = (
+    r"Class/?Interface|Klasse/?Interface|Object\s*Type|Objekttyp|Program|Programm",
+    r"Display|Anzeigen",
+)
+
+_SE24_NAME_FIELDS = (
+    "wnd[0]/usr/ctxtSEOCLASS-CLSNAME",
+    "wnd[0]/usr/txtSEOCLASS-CLSNAME",
+)
+
+_SWO1_NAME_FIELDS = (
+    "wnd[0]/usr/ctxtTOJTB-NAME",
+    "wnd[0]/usr/txtTOJTB-NAME",
+    "wnd[0]/usr/ctxtRSWO-OBJTYPE",
+)
+
+
+def _set_named_field(sap: SapSession, candidates, hints, value: str) -> bool:
+    """Fill the first field that exists, falling back to a name scan."""
+    for element_id in candidates:
+        field = sap.maybe(element_id)
+        if field is not None:
+            try:
+                field.text = value
+                return True
+            except Exception:
+                continue
+    for comp in sap.walk("wnd[0]/usr"):
+        if comp.type not in ("GuiCTextField", "GuiTextField"):
+            continue
+        tech = (comp.name or "").upper()
+        if any(hint in tech for hint in hints):
+            try:
+                comp.obj.text = value
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def _press_display(sap: SapSession, menu, what: str) -> bool:
+    """Press Display via the menu or a self-identifying toolbar button.
+
+    Same rule as everywhere else in this file: never press a control that has
+    not told us what it does, and never one that looks like Execute.
+    """
+    for route in ("menu", "button"):
+        sap.assert_safe_to_navigate()
+        if route == "menu":
+            if not sap.press_menu(menu, forbid=EXECUTE_LABEL):
+                continue
+            used = "menu > Display"
+        else:
+            button, label = sap.find_button(DISPLAY_LABEL, forbid=EXECUTE_LABEL)
+            if button is None:
+                continue
+            try:
+                button.press()
+            except Exception:
+                continue
+            used = f"toolbar button {label!r}"
+
+        time.sleep(0.45)
+        sap.assert_safe_to_navigate()
+        sap.dismiss_popups()
+        sap.assert_safe_to_navigate()
+        sap.log(f"  {what}: opened via {used}")
+        return True
+    return False
+
+
+def switch_to_source_based(sap: SapSession) -> bool:
+    """Flip the Class Builder into its whole-class source view."""
+    button, label = sap.find_button(SOURCE_BASED_LABEL, forbid=EXECUTE_LABEL,
+                                    toolbar="wnd[0]")
+    if button is not None:
+        try:
+            button.press()
+            time.sleep(0.5)
+            sap.dismiss_popups()
+            sap.log(f"  switched to source-code-based view ({label!r})")
+            return True
+        except Exception:
+            pass
+
+    if sap.press_menu(_SOURCE_BASED_MENU, forbid=EXECUTE_LABEL):
+        time.sleep(0.5)
+        sap.dismiss_popups()
+        sap.log("  switched to source-code-based view (menu)")
+        return True
+
+    return False
+
+
+def open_class(sap: SapSession, name: str, settle: float = 0.4) -> Opened:
+    """Open a global class in SE24, display mode, whole-source view.
+
+    Falls back to SE38 on the generated class pool (`ZCL_FOO===...===CP`),
+    which is an ordinary ABAP include and therefore readable by the existing
+    program path.
+    """
+    sap.log(f"  opening class {name} in SE24 (display)")
+    sap.assert_safe_to_navigate()
+    sap.start_transaction("SE24")
+
+    if not _set_named_field(sap, _SE24_NAME_FIELDS, ("CLSNAME", "CLASS"), name):
+        raise SapGuiError("SE24 initial screen not recognised (class name field not found).")
+
+    if _press_display(sap, _SE24_DISPLAY_MENU, f"class {name}"):
+        source_based = switch_to_source_based(sap)
+        if find_editor(sap) is not None or find_source_table(sap) is not None:
+            if not source_based:
+                sap.log("  (source-code-based view unavailable - capturing what is shown)")
+            return Opened(name, Kind.CLASS, source_based=source_based)
+
+    status = sap.status_message()
+    sap.log(f"  SE24 route did not yield an editor{f' ({status})' if status else ''}"
+            f" - trying the generated class pool")
+
+    pool = objects.class_pool(name)
+    open_program(sap, pool, settle)
+    return Opened(pool, Kind.PROGRAM, note=f"class pool of {name}")
+
+
+def open_interface(sap: SapSession, name: str, settle: float = 0.4) -> Opened:
+    """An interface has no method bodies - its implementing class does.
+
+    The SE80 tree's "Implementing Classes" folder is consulted first; if that
+    cannot be read, SAP's proxy naming convention (ZII_X <-> ZCL_X) supplies
+    the candidates.
+    """
+    candidates: List[str] = []
+    try:
+        candidates = includes.implementing_classes_from_tree(sap, name)
+        if candidates:
+            sap.log(f"  SE80 tree lists implementing class(es): {', '.join(candidates)}")
+    except Exception:
+        pass
+
+    for guess in objects.implementing_class_candidates(name):
+        if guess not in candidates:
+            candidates.append(guess)
+
+    if not candidates:
+        raise ExtractionError(
+            f"'{name}' is an interface and has no method implementations.\n"
+            f"No implementing class could be determined from the SE80 tree or "
+            f"from the naming convention."
+        )
+
+    errors = []
+    for candidate in candidates:
+        try:
+            opened = open_class(sap, candidate, settle)
+            opened.note = f"implementing class of {name}"
+            sap.log(f"  using implementing class {candidate}")
+            return opened
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+            continue
+
+    raise ExtractionError(
+        f"Could not open any implementing class for interface '{name}'. "
+        f"Tried: {'; '.join(errors)}"
+    )
+
+
+# Fields on the SWO1 basic-data screen that carry the implementation program
+_BO_PROGRAM_HINTS = ("PROGRAM", "PROGRAMM", "IMPL", "REPID")
+
+
+def open_business_object(sap: SapSession, name: str, settle: float = 0.4) -> Opened:
+    """BOR object type (SWO1).
+
+    A business object has no source of its own: its methods are implemented
+    in an ABAP program named on the object type's basic-data screen.  We open
+    the object type, read that program name off the screen, and then export
+    the program through the normal path.
+    """
+    sap.log(f"  opening business object {name} in SWO1 (display)")
+    sap.assert_safe_to_navigate()
+    sap.start_transaction("SWO1")
+
+    if not _set_named_field(sap, _SWO1_NAME_FIELDS, ("OBJTYPE", "TOJTB", "OBJECT"), name):
+        raise SapGuiError("SWO1 initial screen not recognised (object type field not found).")
+
+    if not _press_display(sap, _SE24_DISPLAY_MENU, f"object type {name}"):
+        raise ExtractionError(f"Could not open business object '{name}' in display mode.")
+
+    program = ""
+    for comp in sap.walk("wnd[0]"):
+        if comp.type not in ("GuiCTextField", "GuiTextField"):
+            continue
+        tech = (comp.name or "").upper()
+        value = (comp.text or "").strip().upper()
+        if not value or not any(hint in tech for hint in _BO_PROGRAM_HINTS):
+            continue
+        if re.match(r"^(/[A-Z0-9_]{1,8}/)?[A-Z_][A-Z0-9_]{2,39}$", value):
+            program = value
+            sap.log(f"  implementation program from field {comp.name}: {program}")
+            break
+
+    if not program:
+        raise ExtractionError(
+            f"Business object '{name}' was opened, but no implementation program "
+            f"name could be read from the SWO1 screen.\n"
+            f"Open the object type in SWO1, note the program under Basic Data, "
+            f"and export that program name directly."
+        )
+
+    open_program(sap, program, settle)
+    return Opened(program, Kind.PROGRAM, note=f"implementation of business object {name}")
+
+
+def open_object(
+    sap: SapSession,
+    name: str,
+    kind: Optional[Kind] = None,
+    settle: float = 0.4,
+) -> Opened:
+    """Open any supported repository object in display mode.
+
+    Dispatches on the object kind; the program/include path is unchanged.
+    """
+    resolved = kind or objects.classify(name, sap.transaction, sap.window_title())
+
+    if resolved == Kind.CLASS:
+        return open_class(sap, name, settle)
+    if resolved == Kind.INTERFACE:
+        return open_interface(sap, name, settle)
+    if resolved == Kind.BUSINESS_OBJECT:
+        return open_business_object(sap, name, settle)
+
+    open_program(sap, name, settle)
+    return Opened(name, Kind.PROGRAM if resolved == Kind.UNKNOWN else resolved)
+
+
+def open_program(sap: SapSession, name: str, settle: float = 0.4) -> None:
     """Open an ABAP program or include in SE38 in *display* mode.
 
     Display mode matters: it never takes an enqueue lock, so the export can run
@@ -586,6 +845,12 @@ def probe_editor(sap: SapSession) -> str:
     document or just the control's ProgID.
     """
     lines = ["", "=" * 72, "ABAP EDITOR PROBE", "=" * 72]
+
+    lines.append(f"Transaction : {sap.transaction}")
+    lines.append(f"Window title: {sap.window_title()!r}")
+    detected = objects.classify("", sap.transaction, sap.window_title())
+    lines.append(f"Screen suggests kind: {detected.value}")
+    lines.append("")
 
     comp = find_editor(sap)
     table = find_source_table(sap)

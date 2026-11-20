@@ -8,6 +8,7 @@ import pytest
 from core import editor as editor_mod
 from core import exporter as exporter_mod
 from core.exporter import ExportOptions, export_program, safe_filename
+from core.objects import Kind
 
 # A miniature "SAP system": object name -> source text
 SYSTEM = {
@@ -45,11 +46,12 @@ class FakeSap:
 def patched(monkeypatch):
     sap = FakeSap(SYSTEM)
 
-    def fake_open(session, name, settle=0.0):
+    def fake_open(session, name, kind=None, settle=0.0):
         if name not in session.system:
             raise editor_mod.ExtractionError(f"Program {name} does not exist")
         session.opened.append(name)
         session.current = name
+        return editor_mod.Opened(name, Kind.PROGRAM)
 
     def fake_extract(session, name, tmp_dir, **kwargs):
         text = session.system[session.current]

@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from .objects import Kind, classify
 from .session import SapSession
 
 # An ABAP program / include name: optional /namespace/, then letters, digits,
@@ -27,6 +28,10 @@ FIELD_HINTS = (
     ("PROGRAMM", 76),
     ("PROGRAM", 74),
     ("REPID", 70),
+    ("SEOCLASS-CLSNAME", 92),      # SE24 initial screen
+    ("TOJTB-NAME", 92),            # SWO1 object type
+    ("CLSNAME", 86),
+    ("OBJTYPE", 84),
     ("OBJECT_NAME", 66),
     ("OBJ_NAME", 64),
     ("INCLUDE", 62),
@@ -43,9 +48,11 @@ TREE_SCORE = 90
 # window caption is "Object Navigator", which parsed as object=NAVIGATOR and
 # beat the correct answer.  A caption is weak evidence anyway - it is scored
 # below every field and tree signal.
+# `object type` is matched as a two-word phrase ("Object Type ZBUS2105"),
+# never bare `object`, which would swallow "Object Navigator".
 TITLE_RE = re.compile(
     r"(?:report|include|programm?|modulpool|module\s+pool|function\s+group|"
-    r"class|interface)\s+"
+    r"class|klasse|interface|object\s+type|objekttyp|business\s+object)\s+"
     r"((?:/[A-Z0-9_]{1,8}/)?[A-Z_][A-Z0-9_]{1,39})",
     re.I,
 )
@@ -90,6 +97,7 @@ class Detection:
     candidates: List[Candidate] = field(default_factory=list)
     transaction: str = ""
     title: str = ""
+    kind: "Kind" = Kind.UNKNOWN
 
     @property
     def evidence(self) -> str:
@@ -175,17 +183,26 @@ def detect_program(sap: SapSession) -> Detection:
 
     ordered = sorted(scores.values(), key=lambda c: (-c.score, c.name))
     best = ordered[0].name if ordered else None
-    return Detection(name=best, candidates=ordered, transaction=tcode, title=title)
+    kind = classify(best, tcode, title) if best else Kind.UNKNOWN
+    return Detection(name=best, candidates=ordered, transaction=tcode,
+                     title=title, kind=kind)
 
 
-def strip_to_main_program(name: str) -> str:
+def strip_to_main_program(name: str, kind: Optional[Kind] = None) -> str:
     """Best-effort mapping from an include back to its main program.
 
     `ZMM_CREATEPO_TOP` / `_F01` / `_O01` ... all belong to `ZMM_CREATEPO`.
     Purely a naming-convention heuristic; it is only used as a *suggestion*
     which the user can override before the export starts.
+
+    Only applied to programs: a class called `ZCL_FOO_C01` is a class in its
+    own right, not an include of `ZCL_FOO`.
     """
     upper = (name or "").upper()
+    resolved = kind or classify(upper)
+    if resolved in (Kind.CLASS, Kind.INTERFACE, Kind.BUSINESS_OBJECT,
+                    Kind.FUNCTION_GROUP):
+        return upper
     match = re.match(r"^(.*?)_(TOP|F\d{2}|O\d{2}|I\d{2}|E\d{2}|P\d{2}|C\d{2}|CL\d{2})$", upper)
     if match and len(match.group(1)) >= 3:
         return match.group(1)

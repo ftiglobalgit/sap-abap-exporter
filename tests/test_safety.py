@@ -148,10 +148,13 @@ def test_export_aborts_whole_run_when_debugger_appears(monkeypatch, tmp_path):
 
     calls = {"n": 0}
 
-    def fake_open(_sap, name, settle=0.0):
+    def fake_open(_sap, name, kind=None, settle=0.0):
         calls["n"] += 1
         if calls["n"] == 2:
             raise DebuggerOpenError("ABAP Debugger is open")
+        from core.editor import Opened
+        from core.objects import Kind
+        return Opened(name, Kind.PROGRAM)
 
     def fake_extract(_sap, name, _tmp, **_kw):
         from core.editor import Source

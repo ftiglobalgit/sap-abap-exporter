@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
-from . import editor, includes
+from . import abapclass, editor, includes, objects
 from .session import DebuggerOpenError, SapSession
 
 LogFn = Callable[[str], None]
@@ -30,6 +30,11 @@ INVALID_FS = re.compile(r'[<>:"/\\|?*]')
 @dataclass
 class ExportOptions:
     output_root: str
+    # Class handling
+    split_methods: bool = True          # one .txt per METHOD ... ENDMETHOD
+    only_redefinitions: bool = False    # for OData *_DPC_EXT / *_MPC_EXT classes
+    methods_subfolder: str = "methods"  # "" writes them beside the class file
+    root_kind: Optional[object] = None  # force the kind of the requested object
     customer_only: bool = False
     use_se80_tree: bool = True
     max_depth: int = 10
@@ -140,10 +145,15 @@ def export_program(
         log(f"[{processed}/{total_known}] {name}")
 
         try:
-            editor.open_object(sap, name)
+            opened = editor.open_object(
+                sap, name, kind=options.root_kind if depth == 0 else None
+            )
+            effective = opened.name
+            if effective != name:
+                log(f"  -> {effective}" + (f"  ({opened.note})" if opened.note else ""))
             source = editor.extract_source(
                 sap,
-                name,
+                effective,
                 tmp_dir,
                 allow_clipboard=options.allow_clipboard,
                 allow_download=options.allow_download,
@@ -177,14 +187,18 @@ def export_program(
             log("  (warning: captured text does not look like ABAP source - "
                 "check this file before relying on it)")
 
-        path, written = _write_source(folder, name, source.text, options)
-        sources[name] = source.text
+        path, written = _write_source(folder, effective, source.text, options)
+        sources[effective] = source.text
         log(f"  {source.line_count} lines via {source.strategy} -> {os.path.basename(path)}")
 
         result.objects.append(
-            ObjectResult(name, path, source.line_count, written,
+            ObjectResult(effective, path, source.line_count, written,
                          source.strategy, parent, depth)
         )
+
+        # A class capture is one document holding every method - split it
+        if options.split_methods and abapclass.looks_like_class_source(source.text):
+            _write_methods(result, folder, source.text, effective, depth, options, log)
 
         # Discover the next generation of includes from what we just read
         if depth < options.max_depth:
@@ -224,6 +238,73 @@ def export_program(
     if result.failed:
         log(f"Failed: {', '.join(o.name for o in result.failed)}")
     return result
+
+
+def _write_methods(
+    result: "ExportResult",
+    folder: str,
+    source: str,
+    class_name: str,
+    depth: int,
+    options: ExportOptions,
+    log: LogFn,
+) -> None:
+    """Split a captured class into one .txt per method.
+
+    No extra SAP round-trips: the whole class arrived in a single capture, so
+    this is pure text slicing.  Each file keeps the method's own comments and
+    indentation exactly as SAP returned them.
+    """
+    try:
+        info = abapclass.parse_class(source)
+    except Exception as exc:
+        log(f"  (could not split methods: {exc})")
+        return
+
+    if not info.methods:
+        log("  no METHOD...ENDMETHOD blocks found in this class")
+        return
+
+    if options.only_redefinitions:
+        selected = info.redefinitions
+        log(f"  {len(info.methods)} method(s) found, "
+            f"{len(selected)} redefinition(s) selected")
+        if not selected:
+            log("  (no redefinitions - nothing to split; "
+                "untick 'Only redefined methods' to export them all)")
+            return
+    else:
+        selected = info.methods
+        log(f"  {len(selected)} method(s) found "
+            f"({len(info.redefinitions)} redefinition(s))")
+
+    target = os.path.join(folder, options.methods_subfolder) \
+        if options.methods_subfolder else folder
+    os.makedirs(target, exist_ok=True)
+
+    for method in selected:
+        path, written = _write_source(target, method.name, method.text, options)
+        tags = []
+        if method.is_redefinition:
+            tags.append("redefinition")
+        if method.is_interface_method:
+            tags.append("interface")
+        strategy = "method-split" + (f" [{'/'.join(tags)}]" if tags else "")
+        result.objects.append(
+            ObjectResult(
+                name=f"{class_name}~{method.name}" if "~" not in method.name
+                     else method.name,
+                path=path,
+                lines=method.line_count,
+                bytes_written=written,
+                strategy=strategy,
+                parent=class_name,
+                depth=depth + 1,
+            )
+        )
+
+    log(f"  wrote {len(selected)} method file(s) to "
+        f"{options.methods_subfolder or os.path.basename(folder)}/")
 
 
 def _write_source(folder: str, name: str, text: str, options: ExportOptions):

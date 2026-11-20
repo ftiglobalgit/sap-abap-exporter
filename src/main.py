@@ -36,6 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"output root folder (default: {DEFAULT_OUTPUT})")
     parser.add_argument("--connection", type=int, default=0, help="SAP connection index")
     parser.add_argument("--session", type=int, default=0, help="SAP session index")
+    parser.add_argument("--kind", default=None,
+                        choices=["program", "class", "interface", "business_object"],
+                        help="force the object kind instead of auto-detecting")
+    parser.add_argument("--no-split-methods", action="store_true",
+                        help="do not write one .txt per class method")
+    parser.add_argument("--only-redefinitions", action="store_true",
+                        help="for OData *_DPC_EXT classes: export only redefined methods")
+    parser.add_argument("--methods-flat", action="store_true",
+                        help="write method files beside the class, not in methods/")
     parser.add_argument("--customer-only", action="store_true",
                         help="skip SAP standard includes")
     parser.add_argument("--no-se80-tree", action="store_true",
@@ -60,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_cli(args) -> int:
     from core.detect import detect_program, strip_to_main_program
+    from core.objects import Kind
     from core.exporter import ExportOptions, export_program
     from core.session import SapGuiError, SapSession
 
@@ -96,11 +106,15 @@ def run_cli(args) -> int:
             log("ERROR: could not detect a program on the current SAP screen.")
             log("       Open the program in SE80/SE38, or pass --program NAME.")
             return 3
-        program = strip_to_main_program(detection.name)
-        log(f"Detected program: {program}  ({detection.evidence})")
+        program = strip_to_main_program(detection.name, detection.kind)
+        log(f"Detected {detection.kind.value}: {program}  ({detection.evidence})")
 
     options = ExportOptions(
         output_root=args.out,
+        split_methods=not args.no_split_methods,
+        only_redefinitions=args.only_redefinitions,
+        methods_subfolder="" if args.methods_flat else "methods",
+        root_kind=Kind(args.kind) if args.kind else None,
         customer_only=args.customer_only,
         use_se80_tree=not args.no_se80_tree,
         allow_clipboard=not args.no_clipboard,
