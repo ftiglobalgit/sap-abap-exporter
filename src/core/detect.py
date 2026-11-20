@@ -19,28 +19,62 @@ from .session import SapSession
 ABAP_NAME = re.compile(r"^(/[A-Z0-9_]{1,8}/)?[A-Z_][A-Z0-9_]{1,39}$")
 
 # Field names that carry a program name on the various editor screens.
+# The score is how much that signal is trusted, 0-100.
 FIELD_HINTS = (
-    ("RS38M-PROGRAMM", 95),       # SE38 initial screen
-    ("RSEUX-OBJECT_NAME", 90),    # SE80 object field
-    ("RSEUI-OBJECT", 85),
-    ("PROGRAM", 70),
-    ("PROGRAMM", 70),
-    ("REPID", 65),
-    ("OBJECT_NAME", 60),
-    ("INCLUDE", 60),
+    ("RS38M-PROGRAMM", 92),       # SE38 initial screen - unambiguous
+    ("RSEUX-OBJECT_NAME", 88),    # SE80 object name field
+    ("RSEUI-OBJECT", 86),
+    ("PROGRAMM", 76),
+    ("PROGRAM", 74),
+    ("REPID", 70),
+    ("OBJECT_NAME", 66),
+    ("OBJ_NAME", 64),
+    ("INCLUDE", 62),
 )
 
+# What the SE80 repository tree says you have selected.  This is the single
+# most direct expression of "the program the user picked", so it outranks
+# everything except a program name typed into SE38 itself.
+TREE_SCORE = 90
+
 # "ABAP Editor: Change Report ZMM_CREATEPO", "ABAP Editor: Display Include ..."
+#
+# NOTE: `object`/`objekt` are deliberately NOT keywords here.  SE80's own
+# window caption is "Object Navigator", which parsed as object=NAVIGATOR and
+# beat the correct answer.  A caption is weak evidence anyway - it is scored
+# below every field and tree signal.
 TITLE_RE = re.compile(
-    r"(?:report|include|program|programm|objekt|object|modulpool|module pool)\s+"
+    r"(?:report|include|programm?|modulpool|module\s+pool|function\s+group|"
+    r"class|interface)\s+"
     r"((?:/[A-Z0-9_]{1,8}/)?[A-Z_][A-Z0-9_]{1,39})",
     re.I,
 )
+TITLE_SCORE = 70
 
+# Whole captions that describe a *screen*, never an object.  If the window
+# title is one of these, no name is taken from it at all.
+GENERIC_TITLES = re.compile(
+    r"^\s*(object navigator|abap workbench|repository browser|"
+    r"repository information system|sap easy access|object selection|"
+    r"abap editor|initial screen|sap r/3)\s*$",
+    re.I,
+)
+
+# Words that are part of SAP's UI vocabulary, never a customer program name.
 NOISE = {
     "DISPLAY", "CHANGE", "ACTIVE", "INACTIVE", "REPORT", "INCLUDE", "PROGRAM",
     "OBJECT", "EDITOR", "SAP", "ABAP", "NONE", "SOURCE", "CODE", "MAIN",
+    "NAVIGATOR", "WORKBENCH", "BROWSER", "REPOSITORY", "INFORMATION",
+    "SYSTEM", "EASY", "ACCESS", "OVERVIEW", "INITIAL", "SCREEN", "WELCOME",
+    "SELECTION", "LIST", "TOOLS", "UTILITIES", "ENVIRONMENT", "POOL",
+    "GROUP", "CLASS", "INTERFACE", "STRUCTURE", "TABLE", "VIEW",
 }
+
+# Customer namespaces get a small tie-break bonus: this tool is used almost
+# exclusively on custom code, and it breaks ties without excluding standard
+# programs outright.
+CUSTOMER_BONUS = 6
+CUSTOMER_RE = re.compile(r"^(Z|Y|SAPMZ|SAPMY|\$|/[A-Z0-9_]{1,8}/)", re.I)
 
 
 @dataclass
@@ -81,6 +115,8 @@ def detect_program(sap: SapSession) -> Detection:
         name = (raw or "").strip().upper()
         if not _plausible(name):
             return
+        if CUSTOMER_RE.match(name):
+            score += CUSTOMER_BONUS
         existing = scores.get(name)
         if existing is None or score > existing.score:
             scores[name] = Candidate(name, score, source)
@@ -88,10 +124,12 @@ def detect_program(sap: SapSession) -> Detection:
     title = sap.window_title()
     tcode = sap.transaction
 
-    # 1) Window title - "ABAP Editor: Change Report ZMM_CREATEPO"
-    match = TITLE_RE.search(title or "")
-    if match:
-        add(match.group(1), 80, "window title")
+    # 1) Window title - "ABAP Editor: Change Report ZMM_CREATEPO".
+    #    Skipped entirely for captions that name a screen rather than an object.
+    if title and not GENERIC_TITLES.match(title.strip()):
+        match = TITLE_RE.search(title)
+        if match:
+            add(match.group(1), TITLE_SCORE, "window title")
 
     # 2) Input / text fields whose technical name points at a program
     for comp in sap.walk("wnd[0]"):
@@ -117,14 +155,20 @@ def detect_program(sap: SapSession) -> Detection:
             if not key:
                 continue
             try:
-                add(str(tree.GetNodeTextByKey(key)), 75, "SE80 tree selection")
+                text = str(tree.GetNodeTextByKey(key))
             except Exception:
-                pass
+                continue
+            # A node caption can be "ZMM_CREATEPO  PR Management Dashboard"
+            first = text.strip().split()[0] if text.strip() else ""
+            score = TREE_SCORE if getter == "selectedNode" else TREE_SCORE - 15
+            add(first, score, f"SE80 tree {getter}")
         break
 
     # 4) Anything in a GuiTitlebar / header label that looks like a program
     for comp in sap.walk("wnd[0]", max_depth=6):
         if comp.type in ("GuiTitlebar", "GuiLabel") and comp.text:
+            if GENERIC_TITLES.match(comp.text.strip()):
+                continue
             match = TITLE_RE.search(comp.text)
             if match:
                 add(match.group(1), 55, "screen header")

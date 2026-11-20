@@ -79,13 +79,22 @@ with the tool, and §7 lists the alternatives.
 
 ### Finding the program you selected
 
-No typing. The app reads the live screen and scores several independent signals:
+No typing. The app reads the live screen and scores several independent signals,
+most-trusted first:
 
-1. The window caption — `ABAP Editor: Change Report ZMM_CREATEPO`
-2. Input fields whose technical name carries a program (`RS38M-PROGRAMM`,
-   `RSEUX-OBJECT_NAME`, …)
-3. The selected node of the SE80 repository-browser tree
-4. Screen headers
+1. The SE38 program field (`RS38M-PROGRAMM`) — you typed it, so it is unambiguous
+2. **The selected node of the SE80 repository-browser tree** — the most direct
+   expression of "the program I picked"
+3. Other fields whose technical name carries a program (`RSEUX-OBJECT_NAME`, …)
+4. The window caption — `ABAP Editor: Change Report ZMM_CREATEPO`
+5. Screen headers
+
+Captions that name a *screen* rather than an object ("Object Navigator", "ABAP
+Workbench", "SAP Easy Access") are ignored outright, and `object` is not treated as
+a title keyword — SE80's own caption is "Object Navigator", which once parsed as
+object=`NAVIGATOR` and outranked the correct answer. Customer namespaces (`Z*`,
+`Y*`, `/ns/`) get a small tie-break bonus. When the top two candidates score within
+10 points the app says so and asks you to confirm.
 
 The highest-scoring candidate is shown in the app **with its evidence**, so you can
 see *why* it was chosen. If you had an include selected (say `ZMM_CREATEPO_TOP`),
@@ -316,7 +325,7 @@ src/
     ├── exporter.py      Breadth-first traversal, file writing, report + manifest
     ├── blind.py         Scripting-free fallback
     └── winutil.py       SendInput, window focus, clipboard
-tests/                   74 tests, no SAP required
+tests/                   97 tests, no SAP required
 ```
 
 ### Tests
@@ -325,7 +334,7 @@ tests/                   74 tests, no SAP required
 python -m pytest tests -q
 ```
 
-74 tests covering:
+97 tests covering:
 
 * **the ABAP parser** - chained statements, comments, string literals,
   `INCLUDE TYPE`, namespaces, circular references;
@@ -333,6 +342,8 @@ python -m pytest tests -q
   fall-through between strategies, weak captures used only as a last resort;
 * **safety** - Execute-labelled controls never chosen, unlabelled buttons never
   pressed, debugger detection, whole-run abort when the debugger appears;
+* **program detection** - generic screen captions ignored, tree selection
+  outranking the window title, include-to-main-program mapping;
 * **export orchestration** - nested includes, missing objects, depth limits,
   customer-only filtering, stop handling, verbatim content preservation.
 

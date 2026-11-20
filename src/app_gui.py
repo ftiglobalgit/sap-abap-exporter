@@ -237,6 +237,13 @@ class ExporterApp:
             if detection.name:
                 suggestion = strip_to_main_program(detection.name)
                 self._post("log", f"Candidates  : {detection.evidence}")
+                ranked = detection.candidates
+                if len(ranked) > 1 and ranked[0].score - ranked[1].score < 10:
+                    self._post(
+                        "log",
+                        f"NOTE: '{ranked[0].name}' and '{ranked[1].name}' scored "
+                        f"almost equally - please confirm the name before exporting.",
+                    )
                 if suggestion != detection.name:
                     self._post(
                         "log",
