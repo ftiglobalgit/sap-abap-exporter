@@ -178,3 +178,98 @@ def test_export_aborts_whole_run_when_debugger_appears(monkeypatch, tmp_path):
     assert calls["n"] == 2, "must stop immediately, not continue to object 3"
     assert any("Debugger" in line for line in logged)
     assert any("aborted" in (o.error or "") for o in result.objects)
+
+
+# -- navigation must be verified, not assumed ----------------------------
+#
+# Field incident (SWO1, DO1): the log said "object type ZBUS_2008: opened
+# via menu > Display" while SAP sat unchanged on "Business Object Builder:
+# Initial Screen".  _press_display returned True because the menu click did
+# not raise - it never checked that anything happened.  Two causes:
+#   1. no verification that the screen changed;
+#   2. find_button only looked at wnd[0]/tbar[1], so SWO1's Display button,
+#      which lives in the screen body, was never found.
+
+class ScreenFake(FakeSession):
+    """A session whose screen only changes when the right control is used."""
+
+    def __init__(self, buttons=(), screen_buttons=(), menu_works=False,
+                 menu_navigates=False, title="Business Object Builder: Initial Screen"):
+        super().__init__(buttons, title)
+        self.logged = []
+        self.log = self.logged.append
+        self._screen_buttons = list(screen_buttons)
+        self._menu_works = menu_works
+        self._menu_navigates = menu_navigates
+        self.menu_presses = 0
+
+    def walk(self, root_id="wnd[0]", max_depth=25):
+        source = self._screen_buttons if "usr" in root_id else self._buttons
+        for index, button in enumerate(source):
+            yield Comp(obj=button, id=f"{root_id}/btn[{index}]", type="GuiButton",
+                       subtype="", name=f"btn[{index}]", text=button.Text)
+
+    def press_menu(self, path, window="wnd[0]", forbid=None):
+        self.menu_presses += 1
+        if not self._menu_works:
+            return False
+        if self._menu_navigates:
+            self._title = "Business Object Builder: Display Object Type"
+        return True
+
+    def navigate_by(self, button):
+        button.pressed = True
+        self._title = "Business Object Builder: Display Object Type"
+
+    def dismiss_popups(self, max_rounds=6):
+        return []
+
+    def status_message(self):
+        return ""
+
+
+def test_a_menu_click_that_changes_nothing_is_not_success(monkeypatch):
+    """The exact bug: menu 'succeeds' but SWO1 never leaves its initial screen."""
+    from core import editor as mod
+
+    sap = ScreenFake(menu_works=True, menu_navigates=False)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    assert mod._press_display(sap, ("Object type", "Display"), "object type X") is False
+    assert any("changed nothing" in m for m in sap.logged)
+
+
+def test_display_button_in_the_screen_body_is_found(monkeypatch):
+    """SWO1 puts Display / Change / Create in wnd[0]/usr, not the toolbar."""
+    from core import editor as mod
+
+    display = FakeButton("Display", "Display object type")
+    sap = ScreenFake(buttons=[], screen_buttons=[display], menu_works=False)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    # pressing it is what moves the screen on
+    display.press = lambda: sap.navigate_by(display)
+
+    # the real find_button must reach into wnd[0]/usr
+    found, label = sap.find_button(mod.DISPLAY_LABEL, forbid=mod.NEVER_PRESS)
+    assert found is display, "Display button in the screen body was not found"
+
+    assert mod._press_display(sap, ("Object type", "Display"), "object type X") is True
+    assert display.pressed
+
+
+def test_change_and_toggle_controls_are_never_pressed():
+    from core.editor import CHANGE_LABEL, NEVER_PRESS
+
+    for label in ["Change", "Ändern", "Display <-> Change", "Edit",
+                  "Display <--> Change"]:
+        assert CHANGE_LABEL.search(label), label
+        assert NEVER_PRESS.search(label), label
+
+
+def test_display_label_still_passes_the_never_press_filter():
+    from core.editor import DISPLAY_LABEL, NEVER_PRESS
+
+    for label in ["Display", "Display (F7)", "Anzeigen", "Display object type"]:
+        assert DISPLAY_LABEL.search(label)
+        assert not NEVER_PRESS.search(label), label

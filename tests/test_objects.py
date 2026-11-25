@@ -145,3 +145,21 @@ def test_business_object_is_left_alone():
 
 def test_program_include_still_maps():
     assert strip_to_main_program("ZMM_CREATEPO_F01") == "ZMM_CREATEPO"
+
+
+# -- business object naming, both spellings -------------------------------
+#
+# ZBUS_2008 (with underscore) was classified as a plain program, so the user
+# had to pick "Business object" from the dropdown by hand.
+
+@pytest.mark.parametrize("name", ["ZBUS_2008", "ZBUS2105", "BUS2012", "BUS_2032",
+                                  "YBUS_1001"])
+def test_business_objects_both_with_and_without_underscore(name):
+    from core.objects import Kind, classify
+    assert classify(name) == Kind.BUSINESS_OBJECT
+
+
+@pytest.mark.parametrize("name", ["ZBUSINESS_HELPER", "ZBUS_TOOLS", "ZBUSY"])
+def test_names_that_merely_start_with_bus_are_programs(name):
+    from core.objects import Kind, classify
+    assert classify(name) == Kind.PROGRAM

@@ -29,7 +29,7 @@ class Kind(str, Enum):
 
 CLASS_PREFIX = re.compile(r"^(/[A-Z0-9_]{1,8}/)?(Z?Y?)CL_", re.I)
 INTERFACE_PREFIX = re.compile(r"^(/[A-Z0-9_]{1,8}/)?(Z|Y)?(IF_|II_)", re.I)
-BUSINESS_OBJECT = re.compile(r"^(Z|Y)?BUS\d{3,6}$", re.I)
+BUSINESS_OBJECT = re.compile(r"^(Z|Y)?BUS_?\d{3,6}$", re.I)
 FUNCTION_GROUP_POOL = re.compile(r"^SAPL", re.I)
 MODULE_POOL = re.compile(r"^SAPM", re.I)
 

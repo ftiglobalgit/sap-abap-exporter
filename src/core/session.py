@@ -656,6 +656,7 @@ class SapSession:
         want: re.Pattern,
         forbid: Optional[re.Pattern] = None,
         toolbar: str = "wnd[0]/tbar[1]",
+        also_screen: bool = True,
     ):
         """Find a toolbar button by what it *says*, not by its index.
 
@@ -666,17 +667,38 @@ class SapSession:
         pressed when its own label or tooltip identifies it, and never when it
         matches the *forbid* pattern.
         """
-        for comp in self.walk(toolbar, max_depth=4):
-            if comp.type != "GuiButton":
-                continue
-            label = f"{comp.text or ''} {_safe(comp.obj, 'Tooltip')}".strip()
-            if not label:
-                continue
-            if forbid is not None and forbid.search(label):
-                continue
-            if want.search(label):
-                return comp.obj, label
+        roots = [toolbar]
+        if also_screen:
+            # SWO1, SE24 and others put Display / Change / Create in the
+            # screen body, not the application toolbar.  Looking only at
+            # tbar[1] misses them entirely.
+            roots.append("wnd[0]/usr")
+
+        for root in roots:
+            for comp in self.walk(root, max_depth=8):
+                if comp.type != "GuiButton":
+                    continue
+                label = f"{comp.text or ''} {_safe(comp.obj, 'Tooltip')}".strip()
+                if not label:
+                    continue
+                if forbid is not None and forbid.search(label):
+                    continue
+                if want.search(label):
+                    return comp.obj, label
         return None, ""
+
+    def screen_fingerprint(self) -> str:
+        """Cheap signature of the current screen, to detect navigation.
+
+        A navigation step that silently does nothing is worse than one that
+        fails loudly, so every press is checked against this.
+        """
+        parts = [self.window_title(), self.transaction]
+        try:
+            parts.append(str(_safe(self.find("wnd[0]"), "Name")))
+        except Exception:
+            pass
+        return "|".join(parts)
 
     def press_menu(
         self,

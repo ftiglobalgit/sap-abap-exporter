@@ -176,6 +176,14 @@ _SOURCE_BASED_MENU = (
     r".*Source\s*Code[\s-]*Based.*|.*Quellcode.*",
 )
 
+# "Display <-> Change" toggles and anything labelled Change must never be
+# pressed while looking for Display: switching to change mode takes an
+# enqueue lock on the object.
+CHANGE_LABEL = re.compile(r"<->|<-->|\bchange\b|\bändern\b|\bandern\b|\bedit\b", re.I)
+NEVER_PRESS = re.compile(
+    f"(?:{EXECUTE_LABEL.pattern})|(?:{CHANGE_LABEL.pattern})", re.I
+)
+
 _SE24_DISPLAY_MENU = (
     r"Class/?Interface|Klasse/?Interface|Object\s*Type|Objekttyp|Program|Programm",
     r"Display|Anzeigen",
@@ -184,6 +192,11 @@ _SE24_DISPLAY_MENU = (
 _SE24_NAME_FIELDS = (
     "wnd[0]/usr/ctxtSEOCLASS-CLSNAME",
     "wnd[0]/usr/txtSEOCLASS-CLSNAME",
+)
+
+_SWO1_DISPLAY_MENU = (
+    r"Object\s*type|Objekttyp|Business\s*object|Edit|Bearbeiten",
+    r"Display|Anzeigen",
 )
 
 _SWO1_NAME_FIELDS = (
@@ -217,31 +230,46 @@ def _set_named_field(sap: SapSession, candidates, hints, value: str) -> bool:
 
 
 def _press_display(sap: SapSession, menu, what: str) -> bool:
-    """Press Display via the menu or a self-identifying toolbar button.
+    """Press Display, and verify that the screen actually changed.
 
-    Same rule as everywhere else in this file: never press a control that has
-    not told us what it does, and never one that looks like Execute.
+    Clicking a menu entry that does nothing raises no error, so without this
+    check a failed navigation is reported as success and the caller goes on
+    to scrape the *initial screen* - which is exactly how a business object
+    export reported "opened via menu > Display" while SWO1 sat untouched on
+    its initial screen.
+
+    The button search deliberately excludes Change and "Display <-> Change"
+    toggles: pressing one would take an enqueue lock on the object.
     """
-    for route in ("menu", "button"):
+    for route in ("button", "menu"):
         sap.assert_safe_to_navigate()
+        before = sap.screen_fingerprint()
+
         if route == "menu":
-            if not sap.press_menu(menu, forbid=EXECUTE_LABEL):
+            if not sap.press_menu(menu, forbid=NEVER_PRESS):
                 continue
             used = "menu > Display"
         else:
-            button, label = sap.find_button(DISPLAY_LABEL, forbid=EXECUTE_LABEL)
+            button, label = sap.find_button(DISPLAY_LABEL, forbid=NEVER_PRESS)
             if button is None:
                 continue
             try:
                 button.press()
             except Exception:
                 continue
-            used = f"toolbar button {label!r}"
+            used = f"button {label!r}"
 
         time.sleep(0.45)
         sap.assert_safe_to_navigate()
         sap.dismiss_popups()
         sap.assert_safe_to_navigate()
+
+        if sap.screen_fingerprint() == before:
+            status = sap.status_message()
+            sap.log(f"  {what}: {used} changed nothing"
+                    + (f" ({status})" if status else ""))
+            continue
+
         sap.log(f"  {what}: opened via {used}")
         return True
     return False
@@ -343,29 +371,26 @@ def open_interface(sap: SapSession, name: str, settle: float = 0.4) -> Opened:
     )
 
 
-# Fields on the SWO1 basic-data screen that carry the implementation program
+# Reaching the ABAP implementation of a BOR object type
+_BO_PROGRAM_MENU = (
+    r"Goto|Springen|Utilities.*|Hilfsmittel.*|Object\s*type|Objekttyp",
+    r"Program|Programm|ABAP\s*Editor|Implementation",
+)
+_BO_PROGRAM_LABEL = re.compile(r"\bprogram\b|\bprogramm\b|ABAP\s*editor", re.I)
 _BO_PROGRAM_HINTS = ("PROGRAM", "PROGRAMM", "IMPL", "REPID")
 
+# "Object Type: Editor Edit Program ZBUS_2008"
+_PROGRAM_IN_TITLE = re.compile(
+    r"program\s+((?:/[A-Z0-9_]{1,8}/)?[A-Z_][A-Z0-9_]{2,39})", re.I
+)
 
-def open_business_object(sap: SapSession, name: str, settle: float = 0.4) -> Opened:
-    """BOR object type (SWO1).
 
-    A business object has no source of its own: its methods are implemented
-    in an ABAP program named on the object type's basic-data screen.  We open
-    the object type, read that program name off the screen, and then export
-    the program through the normal path.
-    """
-    sap.log(f"  opening business object {name} in SWO1 (display)")
-    sap.assert_safe_to_navigate()
-    sap.start_transaction("SWO1")
+def _program_from_screen(sap: SapSession) -> str:
+    """Find the implementation program name on the current SWO1 screen."""
+    match = _PROGRAM_IN_TITLE.search(sap.window_title() or "")
+    if match:
+        return match.group(1).upper()
 
-    if not _set_named_field(sap, _SWO1_NAME_FIELDS, ("OBJTYPE", "TOJTB", "OBJECT"), name):
-        raise SapGuiError("SWO1 initial screen not recognised (object type field not found).")
-
-    if not _press_display(sap, _SE24_DISPLAY_MENU, f"object type {name}"):
-        raise ExtractionError(f"Could not open business object '{name}' in display mode.")
-
-    program = ""
     for comp in sap.walk("wnd[0]"):
         if comp.type not in ("GuiCTextField", "GuiTextField"):
             continue
@@ -374,20 +399,81 @@ def open_business_object(sap: SapSession, name: str, settle: float = 0.4) -> Ope
         if not value or not any(hint in tech for hint in _BO_PROGRAM_HINTS):
             continue
         if re.match(r"^(/[A-Z0-9_]{1,8}/)?[A-Z_][A-Z0-9_]{2,39}$", value):
-            program = value
-            sap.log(f"  implementation program from field {comp.name}: {program}")
-            break
+            sap.log(f"  implementation program from field {comp.name}: {value}")
+            return value
+    return ""
 
-    if not program:
-        raise ExtractionError(
-            f"Business object '{name}' was opened, but no implementation program "
-            f"name could be read from the SWO1 screen.\n"
-            f"Open the object type in SWO1, note the program under Basic Data, "
-            f"and export that program name directly."
+
+def open_business_object(sap: SapSession, name: str, settle: float = 0.4) -> Opened:
+    """BOR object type (SWO1).
+
+    A business object has no source of its own: its methods live in an ABAP
+    program full of `BEGIN_METHOD ... END_METHOD` blocks.  We open the object
+    type, navigate to that program, learn its name, and then re-open it
+    through SE38 in display mode - rather than capturing from whatever mode
+    SWO1 happened to leave the editor in, which can be change mode and would
+    hold a lock.
+    """
+    sap.log(f"  opening business object {name} in SWO1 (display)")
+    sap.assert_safe_to_navigate()
+    sap.start_transaction("SWO1")
+
+    if not _set_named_field(sap, _SWO1_NAME_FIELDS,
+                            ("OBJTYPE", "TOJTB", "OBJECT"), name):
+        raise SapGuiError(
+            "SWO1 initial screen not recognised (object type field not found)."
         )
 
+    if not _press_display(sap, _SWO1_DISPLAY_MENU, f"object type {name}"):
+        raise ExtractionError(
+            f"Could not open business object '{name}' in display mode.\n"
+            f"SWO1 stayed on its initial screen: neither a 'Display' button nor "
+            f"a 'Display' menu entry changed the screen.\n"
+            f"Check that the object type name is correct and that it exists."
+        )
+
+    # Now jump from the object type to its implementation program.
+    program = _program_from_screen(sap)
+
+    if not program:
+        before = sap.screen_fingerprint()
+        reached = False
+        if sap.press_menu(_BO_PROGRAM_MENU, forbid=NEVER_PRESS):
+            reached = True
+        else:
+            button, label = sap.find_button(_BO_PROGRAM_LABEL, forbid=NEVER_PRESS)
+            if button is not None:
+                try:
+                    button.press()
+                    reached = True
+                    sap.log(f"  followed {label!r} to the implementation program")
+                except Exception:
+                    reached = False
+        if reached:
+            time.sleep(settle)
+            sap.dismiss_popups()
+            sap.assert_safe_to_navigate()
+            if sap.screen_fingerprint() != before:
+                program = _program_from_screen(sap)
+
+    if not program:
+        # Last resort: whatever editor SWO1 left us in, capture that.
+        if find_editor(sap) is not None or find_source_table(sap) is not None:
+            sap.log("  capturing the editor SWO1 opened (program name unknown)")
+            return Opened(name, Kind.PROGRAM,
+                          note=f"implementation of business object {name}")
+        raise ExtractionError(
+            f"Business object '{name}' was opened, but its implementation "
+            f"program could not be reached.\n"
+            f"In SWO1, use Goto > Program (or open the object type and note the "
+            f"program name), then export that program name directly - set "
+            f"Object type to 'Program / Include'."
+        )
+
+    sap.log(f"  implementation program: {program}")
     open_program(sap, program, settle)
-    return Opened(program, Kind.PROGRAM, note=f"implementation of business object {name}")
+    return Opened(program, Kind.PROGRAM,
+                  note=f"implementation of business object {name}")
 
 
 def open_object(
