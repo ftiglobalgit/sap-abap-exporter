@@ -99,6 +99,7 @@ class SessionEntry:
     transaction: str = ""
     description: str = ""
     error: str = ""
+    reason: str = ""          # "blocked" | "no_session" | "unreadable"
 
     @property
     def usable(self) -> bool:
@@ -209,7 +210,8 @@ def enumerate_sessions(log: LogFn = _noop) -> Tuple[List[SessionEntry], List[str
         try:
             conn = engine.Children(ci)
         except Exception as exc:
-            entries.append(SessionEntry(ci, 0, error=f"connection unreadable ({exc})"))
+            entries.append(SessionEntry(
+                ci, 0, error=f"connection unreadable ({exc})", reason="unreadable"))
             continue
 
         description = ""
@@ -227,39 +229,78 @@ def enumerate_sessions(log: LogFn = _noop) -> Tuple[List[SessionEntry], List[str
         except Exception as exc:
             entries.append(SessionEntry(
                 ci, 0, description=description,
-                error=_blocked_reason(exc),
+                error=_blocked_reason(exc), reason="blocked",
             ))
             continue
 
         if session_count == 0:
+            # The connection is visible but exposes no session to scripting.
+            # This is NOT the same as the server refusing scripting, and the
+            # overwhelmingly common cause is that the connection was opened
+            # before sapgui/user_scripting was switched on: capability is
+            # negotiated at logon, so an existing connection keeps the old
+            # state until you log off and on again.
             entries.append(SessionEntry(
                 ci, 0, description=description,
-                error="connection has no open session",
+                error="no session visible to scripting "
+                      "(opened before scripting was enabled?)",
+                reason="no_session",
             ))
             continue
 
         for si in range(session_count):
             entries.append(_read_session(conn, ci, si, description))
 
-    usable = [e for e in entries if e.usable]
-    blocked = [e for e in entries if not e.usable]
-    if blocked and not usable:
-        notes.append(
-            "Every SAP connection refused scripting access.\n"
-            "This is set per system by your Basis team:\n"
-            "    sapgui/user_scripting = TRUE   (transaction RZ11)\n"
-            "A system where it is FALSE never appears here, even though you "
-            "are logged on to it."
-        )
-    elif blocked:
-        names = ", ".join(e.system or e.description or f"connection {e.connection_index}"
-                          for e in blocked)
-        notes.append(
-            f"{len(blocked)} connection(s) refused scripting access ({names}). "
-            f"Those systems need sapgui/user_scripting = TRUE."
+    notes.extend(_advice(entries))
+    return entries, notes
+
+
+def _name_of(entry: "SessionEntry") -> str:
+    return (entry.system or entry.description
+            or f"connection {entry.connection_index}")
+
+
+def _advice(entries: List["SessionEntry"]) -> List[str]:
+    """Turn the failures into advice that matches what actually went wrong.
+
+    Keeping these apart matters: telling someone to set a profile parameter
+    that their RZ11 screen already shows as TRUE sends them down the wrong
+    path entirely.
+    """
+    out: List[str] = []
+    blocked = [e for e in entries if e.reason == "blocked"]
+    stale = [e for e in entries if e.reason == "no_session"]
+
+    if blocked:
+        names = ", ".join(_name_of(e) for e in blocked)
+        out.append(
+            f"{len(blocked)} connection(s) refused scripting access ({names}).\n"
+            "The server has scripting switched off for that system. Ask Basis for:\n"
+            "    sapgui/user_scripting              = TRUE\n"
+            "    sapgui/user_scripting_set_readonly = FALSE"
         )
 
-    return entries, notes
+    if stale:
+        names = ", ".join(_name_of(e) for e in stale)
+        out.append(
+            f"{len(stale)} connection(s) expose no session to scripting ({names}).\n"
+            "\n"
+            "If RZ11 already shows sapgui/user_scripting = TRUE on that system,\n"
+            "the parameter is fine and the CONNECTION is stale. SAP GUI decides\n"
+            "whether scripting is allowed when you log on, so a connection that\n"
+            "was already open keeps the old setting.\n"
+            "\n"
+            "  1. Log off that system completely (close the connection in SAP\n"
+            "     Logon, not just the window), then log on again.\n"
+            "  2. Press Refresh here.\n"
+            "\n"
+            "If it still does not appear, the parameter was probably set on one\n"
+            "application server only. In RZ11, change it again with the\n"
+            "'Switch on all servers' box ticked - with load balancing you may\n"
+            "land on a different server each time you log on."
+        )
+
+    return out
 
 
 def _blocked_reason(exc: Exception) -> str:
@@ -273,12 +314,14 @@ def _read_session(conn, ci: int, si: int, description: str) -> SessionEntry:
     try:
         sess = conn.Children(si)
     except Exception as exc:
-        return SessionEntry(ci, si, description=description, error=_blocked_reason(exc))
+        return SessionEntry(ci, si, description=description,
+                            error=_blocked_reason(exc), reason="blocked")
 
     try:
         info = sess.Info
     except Exception as exc:
-        return SessionEntry(ci, si, description=description, error=_blocked_reason(exc))
+        return SessionEntry(ci, si, description=description,
+                            error=_blocked_reason(exc), reason="blocked")
 
     return SessionEntry(
         connection_index=ci,
@@ -318,7 +361,9 @@ class SapSession:
                 "  [x] Enable scripting   (and clear the two 'Notify when...' boxes)\n\n"
                 "If it is still blocked, the server profile parameter\n"
                 "  sapgui/user_scripting = TRUE\n"
-                "must be set by your Basis team (read-only scripting is enough)."
+                "must be set by your Basis team, together with\n"
+                "  sapgui/user_scripting_set_readonly = FALSE\n"
+                "(read-only mode blocks typing a program name and pressing Display)."
                 + (f"\n\n{hint}" if hint else "")
             )
 

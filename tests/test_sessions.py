@@ -176,7 +176,7 @@ def test_blocked_connection_is_explained_not_silently_dropped(monkeypatch):
     assert len(entries) == 1
     assert not entries[0].usable
     assert "sapgui/user_scripting" in entries[0].error
-    assert any("sapgui/user_scripting = TRUE" in n for n in notes)
+    assert any("sapgui/user_scripting" in n and "TRUE" in n for n in notes)
 
 
 def test_all_sessions_of_all_systems_are_listed(monkeypatch):
@@ -247,7 +247,8 @@ def test_connection_with_no_session_is_reported(monkeypatch):
     _install(monkeypatch, FakeEngine([_conn([], "ECC DEV DO1")]))
     entries, _ = enumerate_sessions()
     assert len(entries) == 1
-    assert "no open session" in entries[0].error
+    assert "no session visible to scripting" in entries[0].error
+    assert entries[0].reason == "no_session"
 
 
 # -- attach picks a usable session ---------------------------------------
@@ -288,3 +289,60 @@ def test_list_sessions_returns_labels(monkeypatch):
     labels = mod.SapSession.list_sessions()
     assert len(labels) == 2
     assert "DE4" in labels[0] and "DO1" in labels[1]
+
+
+# -- distinguishing "no session" from "scripting refused" -----------------
+#
+# Field incident: DO1 had sapgui/user_scripting = TRUE (confirmed in RZ11,
+# Current Value TRUE) but the connection exposed zero sessions, because it
+# had been opened before the parameter was switched on.  The old summary
+# still said "refused scripting access ... needs sapgui/user_scripting =
+# TRUE", sending the user to re-check a parameter that was already correct.
+
+def test_connection_with_no_sessions_is_not_called_a_scripting_refusal(monkeypatch):
+    _install(monkeypatch, FakeEngine([_conn([DE4], "ECC DEV DE4"),
+                                      _conn([], "ECC DEV DO1")]))
+    entries, notes = enumerate_sessions()
+
+    stale = [e for e in entries if e.reason == "no_session"]
+    assert len(stale) == 1
+    joined = "\n".join(notes)
+    assert "refused scripting access" not in joined
+    assert "sapgui/user_scripting              = TRUE" not in joined
+
+
+def test_stale_connection_advice_says_log_off_and_on(monkeypatch):
+    _install(monkeypatch, FakeEngine([_conn([], "ECC DEV DO1")]))
+    _entries, notes = enumerate_sessions()
+    joined = "\n".join(notes)
+    assert "Log off that system completely" in joined
+    assert "Switch on all servers" in joined
+    assert "ECC DEV DO1" in joined
+
+
+def test_real_refusal_still_names_the_parameters(monkeypatch):
+    _install(monkeypatch, FakeEngine([
+        _blocked_conn(Exception("scripting is disabled"), "ECC QAS QO1")]))
+    _entries, notes = enumerate_sessions()
+    joined = "\n".join(notes)
+    assert "refused scripting access" in joined
+    assert "sapgui/user_scripting              = TRUE" in joined
+    assert "set_readonly = FALSE" in joined
+
+
+def test_both_problems_get_their_own_advice(monkeypatch):
+    _install(monkeypatch, FakeEngine([
+        _blocked_conn(Exception("scripting is disabled"), "ECC QAS QO1"),
+        _conn([], "ECC DEV DO1"),
+    ]))
+    _entries, notes = enumerate_sessions()
+    assert len(notes) == 2
+    joined = "\n".join(notes)
+    assert "ECC QAS QO1" in joined and "ECC DEV DO1" in joined
+
+
+def test_reason_is_empty_for_healthy_sessions(monkeypatch):
+    _install(monkeypatch, FakeEngine([_conn([DE4], "ECC DEV DE4")]))
+    entries, notes = enumerate_sessions()
+    assert entries[0].usable and entries[0].reason == ""
+    assert notes == []
