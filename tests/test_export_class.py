@@ -190,3 +190,37 @@ def test_plain_program_export_is_unchanged(patched, tmp_path):
     assert (folder / "ZMM_CREATEPO_TOP.txt").exists()
     assert not (folder / "methods").exists()   # a report has no methods
     assert not result.failed
+
+
+# -- business object: one file per BOR method ----------------------------
+
+from test_abapclass import BOR
+
+
+def test_business_object_methods_are_split(monkeypatch, tmp_path):
+    from core import editor as ed
+
+    class Sap:
+        transaction = "SWO1"
+        def log(self, _m): pass
+
+    monkeypatch.setattr(exporter_mod.editor, "open_object",
+                        lambda s, n, kind=None, settle=0: ed.Opened(
+                            "ZBUS_2008", Kind.PROGRAM,
+                            note="implementation of business object ZBUS_2008"))
+    monkeypatch.setattr(exporter_mod.editor, "extract_source",
+                        lambda s, n, t, **k: ed.Source(n, BOR, "clipboard", 30))
+    monkeypatch.setattr(exporter_mod.includes, "includes_from_se80_tree",
+                        lambda s, p: [])
+
+    export_program(Sap(), "ZBUS_2008",
+                   ExportOptions(output_root=str(tmp_path), line_ending="\n"))
+
+    folder = tmp_path / "ZBUS_2008"
+    assert (folder / "ZBUS_2008.txt").exists()
+    methods = {p.name for p in (folder / "methods").glob("*.txt")}
+    assert methods == {"GET_USER_LIST.txt", "MAIL_APPROVE.txt"}
+
+    body = (folder / "methods" / "GET_USER_LIST.txt").read_text()
+    assert body.startswith("begin_method get_user_list")
+    assert body.rstrip().endswith("end_method.")

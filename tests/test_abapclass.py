@@ -245,3 +245,82 @@ def test_a_report_is_not_class_source():
 def test_empty_capture_is_not_class_source():
     assert not looks_like_class_source("")
     assert not looks_like_class_source("SAPGUI.AbapEditor.1")
+
+
+# -- BOR implementation programs (SWO1 object types) ----------------------
+#
+# Transcribed from ZBUS_2008 (Object Type: Editor Display Program ZBUS_2008).
+
+BOR = """*****        Implementation of object type ZBUS_2008        *****
+INCLUDE <object>.
+BEGIN_DATA OBJECT. " Do not change.. DATA is generated
+* only private members may be inserted into structure private
+DATA:
+" begin of private,
+"   to declare private attributes remove comments and
+"   insert private attributes here ...
+" end of private,
+  BEGIN OF KEY,
+    ZAPQ LIKE ZTB_GPU_IR_APQ_H-ZAPQ,
+  END OF KEY.
+END_DATA OBJECT. " Do not change.. DATA is generated
+
+begin_method get_user_list changing container.
+DATA:
+  creater      TYPE but000-xubname,
+  workitem_id  TYPE swwwihead-wi_id.
+
+swc_get_element container 'CREATER' creater.
+swc_get_element container 'WORKITEM_ID' workitem_id.
+end_method.
+
+begin_method mail_approve changing container.
+DATA:
+  level_code TYPE ztb_gpu_config-zlevel.
+swc_get_element container 'LEVEL_CODE' level_code.
+end_method.
+"""
+
+
+def test_bor_source_is_recognised():
+    from core.abapclass import looks_like_bor_source
+    assert looks_like_bor_source(BOR)
+
+
+def test_a_class_is_not_bor_source():
+    from core.abapclass import looks_like_bor_source
+    assert not looks_like_bor_source(PROXY)
+
+
+def test_a_plain_report_is_not_bor_source():
+    from core.abapclass import looks_like_bor_source
+    assert not looks_like_bor_source("REPORT ztest.\nWRITE 'hi'.\n")
+
+
+def test_bor_methods_are_sliced():
+    from core.abapclass import parse_bor_methods
+    methods = parse_bor_methods(BOR, "ZBUS_2008")
+    assert [m.name for m in methods] == ["GET_USER_LIST", "MAIL_APPROVE"]
+
+
+def test_bor_method_body_is_verbatim():
+    from core.abapclass import parse_bor_methods
+    body = parse_bor_methods(BOR, "ZBUS_2008")[0].text
+    assert body.startswith("begin_method get_user_list changing container.")
+    assert body.rstrip().endswith("end_method.")
+    assert "swc_get_element container 'WORKITEM_ID' workitem_id." in body
+    assert "mail_approve" not in body
+
+
+def test_begin_data_object_is_not_a_method():
+    from core.abapclass import parse_bor_methods
+    methods = parse_bor_methods(BOR, "ZBUS_2008")
+    assert all("DATA" not in m.name for m in methods)
+    assert len(methods) == 2
+
+
+def test_bor_class_source_detection_does_not_overlap():
+    """A BOR program must not be mistaken for a class, or vice versa."""
+    from core.abapclass import looks_like_bor_source, looks_like_class_source
+    assert looks_like_bor_source(BOR) and not looks_like_class_source(BOR)
+    assert looks_like_class_source(ODATA) and not looks_like_bor_source(ODATA)

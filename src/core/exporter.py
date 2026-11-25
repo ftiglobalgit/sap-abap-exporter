@@ -199,6 +199,9 @@ def export_program(
         # A class capture is one document holding every method - split it
         if options.split_methods and abapclass.looks_like_class_source(source.text):
             _write_methods(result, folder, source.text, effective, depth, options, log)
+        elif options.split_methods and abapclass.looks_like_bor_source(source.text):
+            _write_methods(result, folder, source.text, effective, depth, options,
+                           log, bor=True)
 
         # Discover the next generation of includes from what we just read
         if depth < options.max_depth:
@@ -248,6 +251,7 @@ def _write_methods(
     depth: int,
     options: ExportOptions,
     log: LogFn,
+    bor: bool = False,
 ) -> None:
     """Split a captured class into one .txt per method.
 
@@ -256,7 +260,13 @@ def _write_methods(
     indentation exactly as SAP returned them.
     """
     try:
-        info = abapclass.parse_class(source)
+        if bor:
+            info = abapclass.ClassInfo(
+                name=class_name,
+                methods=abapclass.parse_bor_methods(source, class_name),
+            )
+        else:
+            info = abapclass.parse_class(source)
     except Exception as exc:
         log(f"  (could not split methods: {exc})")
         return

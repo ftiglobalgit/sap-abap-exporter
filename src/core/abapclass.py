@@ -222,3 +222,65 @@ def method_filename(method: MethodBlock) -> str:
     illegal `/` is dealt with by the caller's `safe_filename`.
     """
     return method.name
+
+
+# --------------------------------------------------------------------------
+# BOR (Business Object Repository) implementation programs
+# --------------------------------------------------------------------------
+#
+# A SWO1 object type's program is not a class; its methods are delimited by
+# the BOR macros:
+#
+#     begin_method get_user_list changing container.
+#       ...
+#     end_method.
+#
+# Splitting those gives business objects the same one-file-per-method output
+# that classes get.
+
+BOR_METHOD_START = re.compile(
+    r"^\s*begin_method\s+([A-Za-z_][\w]*)", re.I
+)
+BOR_METHOD_END = re.compile(r"^\s*end_method\s*\.", re.I)
+BOR_MARKERS = re.compile(
+    r"\bbegin_method\b|\bbegin_data\s+object\b|\bswc_get_element\b", re.I
+)
+
+
+def looks_like_bor_source(text: str) -> bool:
+    """Is this the implementation program of a BOR object type?"""
+    if not text:
+        return False
+    return bool(BOR_MARKERS.search(strip_comments(text)))
+
+
+def parse_bor_methods(source: str, owner: str = "") -> List[MethodBlock]:
+    """Slice `begin_method ... end_method.` blocks out of a BOR program."""
+    normalised = (source or "").replace("\r\n", "\n").replace("\r", "\n")
+    original = normalised.split("\n")
+    stripped = strip_comments(normalised).split("\n")
+
+    blocks: List[MethodBlock] = []
+    open_method: Optional[tuple] = None
+
+    for index, line in enumerate(stripped):
+        if open_method is None:
+            start = BOR_METHOD_START.match(line)
+            if start:
+                open_method = (start.group(1).upper(), index)
+            continue
+        if BOR_METHOD_END.match(line):
+            name, start_index = open_method
+            body = "\n".join(original[start_index:index + 1])
+            blocks.append(
+                MethodBlock(
+                    name=name,
+                    class_name=(owner or "").upper(),
+                    start_line=start_index + 1,
+                    end_line=index + 1,
+                    text=body.rstrip("\n") + "\n",
+                )
+            )
+            open_method = None
+
+    return blocks
