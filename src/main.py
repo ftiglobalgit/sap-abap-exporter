@@ -80,13 +80,15 @@ def run_cli(args) -> int:
         return run_blind(args, log)
 
     if args.list_sessions:
-        sessions = SapSession.list_sessions()
-        if not sessions:
-            log("No SAP GUI session found.")
-            return 2
-        for item in sessions:
-            log(item)
-        return 0
+        from core.session import enumerate_sessions
+
+        entries, notes = enumerate_sessions(log)
+        for entry in entries:
+            log(("   " if entry.usable else "!! ") + entry.label)
+        for note in notes:
+            log("")
+            log(note)
+        return 0 if any(e.usable for e in entries) else 2
 
     try:
         sap = SapSession.attach(args.connection, args.session, log=log)

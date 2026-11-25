@@ -1,4 +1,4 @@
-﻿================================================================================
+﻿﻿================================================================================
             SAP ABAP SOURCE EXPORTER - HƯỚNG DẪN SỬ DỤNG
 ================================================================================
 
@@ -222,6 +222,15 @@ Không dùng RFC. Không cài đặt gì trên hệ thống SAP.
   "No running SAP GUI found"
       -> Chưa mở SAP Logon, hoặc file .exe đang chạy quyền Administrator
          còn SAP thì không (hoặc ngược lại). Chạy cả hai cùng quyền.
+
+  Thiếu 1 hệ thống trong danh sách "SAP session"
+      (ví dụ: DE4 hiện ra nhưng DO1 không hiện)
+      -> Scripting được bật RIÊNG cho từng hệ thống bằng tham số
+         sapgui/user_scripting. Hệ thống nào để FALSE sẽ không hiện ra,
+         dù bạn đang đăng nhập bình thường.
+         Xem khung log: dòng có dấu "!!" là connection bị chặn.
+         Gửi tên hệ thống đó cho team Basis để set:
+             sapgui/user_scripting = TRUE   (transaction RZ11)
 
   "SAP GUI is running but the scripting engine is not reachable"
       -> Chưa bật Enable scripting. Xem lại Mục 2.

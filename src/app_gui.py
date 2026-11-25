@@ -21,7 +21,9 @@ from core import VERSION
 from core.detect import detect_program, strip_to_main_program
 from core.exporter import ExportOptions, export_program
 from core.objects import Kind
-from core.session import SapGuiError, SapSession, ScriptingDisabledError
+from core.session import (
+    SapGuiError, SapSession, ScriptingDisabledError, enumerate_sessions,
+)
 
 DEFAULT_OUTPUT = os.path.join(os.path.expanduser("~"), "Documents", "ABAP_Export")
 
@@ -246,17 +248,39 @@ class ExporterApp:
 
     def refresh_sessions(self) -> None:
         def job():
-            sessions = SapSession.list_sessions()
-            self._post("sessions", sessions)
-            if sessions:
-                self._post("status", f"{len(sessions)} SAP session(s) available")
-                self._post("log", "Available SAP sessions:")
-                for s in sessions:
-                    self._post("log", f"  {s}")
+            entries, notes = enumerate_sessions()
+            usable = [e for e in entries if e.usable]
+            blocked = [e for e in entries if not e.usable]
+
+            # Only usable sessions go in the picker, but everything SAP
+            # reported is shown in the log - an empty dropdown must never be
+            # the whole story.
+            self._post("sessions", [e.label for e in usable])
+
+            if entries:
+                self._post("log", "SAP connections reported by SAP GUI:")
+                for entry in entries:
+                    mark = "  " if entry.usable else "  !! "
+                    self._post("log", f"{mark}{entry.label}")
+            else:
+                self._post("log", "SAP GUI reported no connections at all.")
+
+            for note in notes:
+                self._post("log", "")
+                for line in note.splitlines():
+                    self._post("log", line)
+
+            if usable:
+                status = f"{len(usable)} session(s) available"
+                if blocked:
+                    status += f", {len(blocked)} blocked by the server"
+                self._post("status", status)
+            elif blocked:
+                self._post("status",
+                           f"{len(blocked)} connection(s) found, none allow scripting")
             else:
                 self._post("status", "No SAP GUI session found")
-                self._post("log",
-                           "No SAP GUI session found. Log on to SAP, then press Refresh.")
+
         self._run_worker(job)
 
     def detect(self) -> None:

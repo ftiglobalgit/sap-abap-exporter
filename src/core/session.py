@@ -82,6 +82,215 @@ def describe(obj) -> Comp:
     )
 
 
+@dataclass
+class SessionEntry:
+    """One SAP GUI session, as far as we were able to read it.
+
+    A session that cannot be read is still listed, with the reason, because
+    "this system blocks scripting" is a far more useful thing to show the
+    user than an empty dropdown.
+    """
+
+    connection_index: int
+    session_index: int
+    system: str = ""
+    client: str = ""
+    user: str = ""
+    transaction: str = ""
+    description: str = ""
+    error: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return not self.error
+
+    @property
+    def label(self) -> str:
+        head = f"{self.connection_index}:{self.session_index}"
+        if self.error:
+            name = self.system or self.description or "unknown system"
+            return f"{head}  {name}  -- {self.error}"
+        return (
+            f"{head}  {self.system} client {self.client} "
+            f"user {self.user} [{self.transaction}]"
+        )
+
+
+def _scripting_engine(retries: int = 3, pause: float = 0.4):
+    """Attach to the running SAP GUI, retrying briefly.
+
+    The ROT registration can lag a moment after SAP Logon starts, and the
+    first call right after the user presses Refresh sometimes misses it.
+    """
+    try:
+        import win32com.client
+    except ImportError as exc:  # pragma: no cover - Windows only
+        return None, RuntimeError(
+            "pywin32 is not installed - run: pip install pywin32"
+        )
+
+    last: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            sap_gui_auto = win32com.client.GetObject("SAPGUI")
+        except Exception as exc:
+            last = exc
+            time.sleep(pause)
+            continue
+        try:
+            engine = sap_gui_auto.GetScriptingEngine
+            if engine is not None:
+                return engine, None
+            last = RuntimeError("the scripting engine returned nothing")
+        except Exception as exc:
+            last = exc
+        time.sleep(pause)
+    return None, last
+
+
+def _elevation_hint() -> str:
+    """COM cannot cross integrity levels - a very common cause of 'not found'."""
+    try:
+        import ctypes
+
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return (
+                "This exporter is running as Administrator. SAP GUI is probably "
+                "not, and COM cannot see across elevation levels.\n"
+                "Close it and start it normally (not 'Run as administrator')."
+            )
+    except Exception:
+        pass
+    return ""
+
+
+def enumerate_sessions(log: LogFn = _noop) -> Tuple[List[SessionEntry], List[str]]:
+    """Every session of every connection, with per-item error isolation.
+
+    Each connection and each session is read inside its own try/except.  One
+    system that refuses to be read must never hide the others: SAP GUI
+    Scripting is authorised *per system* by the server profile parameter
+    `sapgui/user_scripting`, so it is completely normal for one system in the
+    list to answer and the next to refuse.
+    """
+    entries: List[SessionEntry] = []
+    notes: List[str] = []
+
+    engine, error = _scripting_engine()
+    if engine is None:
+        notes.append(f"Could not reach the SAP GUI scripting engine: {error}")
+        hint = _elevation_hint()
+        if hint:
+            notes.append(hint)
+        return entries, notes
+
+    # How many connections?  Connections.Count is the documented way;
+    # Children.Count is the fallback some releases prefer.
+    count = None
+    for attr in ("Connections", "Children"):
+        try:
+            count = int(getattr(engine, attr).Count)
+            break
+        except Exception:
+            continue
+    if count is None:
+        notes.append("The scripting engine is reachable but refused to list connections.")
+        return entries, notes
+
+    if count == 0:
+        notes.append(
+            "SAP GUI is running but exposes no connections to scripting.\n"
+            "Either you are not logged on, or SAP GUI was started before "
+            "scripting was enabled - log off and on again."
+        )
+        return entries, notes
+
+    for ci in range(count):
+        try:
+            conn = engine.Children(ci)
+        except Exception as exc:
+            entries.append(SessionEntry(ci, 0, error=f"connection unreadable ({exc})"))
+            continue
+
+        description = ""
+        for attr in ("Description", "ConnectionString"):
+            try:
+                value = str(getattr(conn, attr) or "").strip()
+            except Exception:
+                continue
+            if value:
+                description = value[:60]
+                break
+
+        try:
+            session_count = int(conn.Children.Count)
+        except Exception as exc:
+            entries.append(SessionEntry(
+                ci, 0, description=description,
+                error=_blocked_reason(exc),
+            ))
+            continue
+
+        if session_count == 0:
+            entries.append(SessionEntry(
+                ci, 0, description=description,
+                error="connection has no open session",
+            ))
+            continue
+
+        for si in range(session_count):
+            entries.append(_read_session(conn, ci, si, description))
+
+    usable = [e for e in entries if e.usable]
+    blocked = [e for e in entries if not e.usable]
+    if blocked and not usable:
+        notes.append(
+            "Every SAP connection refused scripting access.\n"
+            "This is set per system by your Basis team:\n"
+            "    sapgui/user_scripting = TRUE   (transaction RZ11)\n"
+            "A system where it is FALSE never appears here, even though you "
+            "are logged on to it."
+        )
+    elif blocked:
+        names = ", ".join(e.system or e.description or f"connection {e.connection_index}"
+                          for e in blocked)
+        notes.append(
+            f"{len(blocked)} connection(s) refused scripting access ({names}). "
+            f"Those systems need sapgui/user_scripting = TRUE."
+        )
+
+    return entries, notes
+
+
+def _blocked_reason(exc: Exception) -> str:
+    text = str(exc).lower()
+    if "disabled" in text or "not permitted" in text or "denied" in text:
+        return "scripting disabled for this system (sapgui/user_scripting)"
+    return "scripting refused by this system (sapgui/user_scripting?)"
+
+
+def _read_session(conn, ci: int, si: int, description: str) -> SessionEntry:
+    try:
+        sess = conn.Children(si)
+    except Exception as exc:
+        return SessionEntry(ci, si, description=description, error=_blocked_reason(exc))
+
+    try:
+        info = sess.Info
+    except Exception as exc:
+        return SessionEntry(ci, si, description=description, error=_blocked_reason(exc))
+
+    return SessionEntry(
+        connection_index=ci,
+        session_index=si,
+        system=str(_safe(info, "SystemName")),
+        client=str(_safe(info, "Client")),
+        user=str(_safe(info, "User")),
+        transaction=str(_safe(info, "Transaction")),
+        description=description,
+    )
+
+
 class SapSession:
     """Drives one SAP GUI session window."""
 
@@ -98,59 +307,57 @@ class SapSession:
         session_index: int = 0,
         log: LogFn = _noop,
     ) -> "SapSession":
-        try:
-            import win32com.client
-        except ImportError as exc:  # pragma: no cover
-            raise SapGuiError(
-                "pywin32 is not installed - run: pip install pywin32"
-            ) from exc
-
-        try:
-            sap_gui_auto = win32com.client.GetObject("SAPGUI")
-        except Exception as exc:
-            raise SapGuiError(
-                "No running SAP GUI found.\n\n"
-                "Start SAP Logon, open a session and log on to your system first."
-            ) from exc
-
-        try:
-            application = sap_gui_auto.GetScriptingEngine
-        except Exception as exc:
+        application, engine_error = _scripting_engine()
+        if application is None:
+            hint = _elevation_hint()
             raise ScriptingDisabledError(
                 "SAP GUI is running but the scripting engine is not reachable.\n\n"
+                f"({engine_error})\n\n"
                 "Enable it with:\n"
                 "  SAP Logon > Options > Accessibility & Scripting > Scripting >\n"
                 "  [x] Enable scripting   (and clear the two 'Notify when...' boxes)\n\n"
                 "If it is still blocked, the server profile parameter\n"
                 "  sapgui/user_scripting = TRUE\n"
                 "must be set by your Basis team (read-only scripting is enough)."
-            ) from exc
+                + (f"\n\n{hint}" if hint else "")
+            )
 
-        if application is None:
-            raise ScriptingDisabledError("The SAP GUI scripting engine returned nothing.")
+        # Enumerate first, so a system that refuses scripting produces a
+        # precise message instead of hiding every other system.
+        entries, notes = enumerate_sessions(log)
+        usable = [e for e in entries if e.usable]
+
+        if not usable:
+            detail = "\n".join(notes) if notes else ""
+            listed = "\n".join(f"  {e.label}" for e in entries)
+            raise ScriptingDisabledError(
+                "No SAP session is available to scripting.\n\n"
+                + (f"What SAP GUI reported:\n{listed}\n\n" if listed else "")
+                + (detail or
+                   "Log on to SAP, then press Refresh.")
+            )
+
+        chosen = None
+        for entry in usable:
+            if (entry.connection_index == connection_index
+                    and entry.session_index == session_index):
+                chosen = entry
+                break
+        if chosen is None:
+            chosen = usable[0]
+            log(f"Session {connection_index}:{session_index} is not available; "
+                f"using {chosen.connection_index}:{chosen.session_index} instead.")
+
+        connection_index = chosen.connection_index
+        session_index = chosen.session_index
 
         try:
-            conn_count = int(application.Connections.Count)
+            connection = application.Children(connection_index)
+            session = connection.Children(session_index)
         except Exception as exc:
-            raise SapGuiError("Could not enumerate SAP GUI connections.") from exc
-
-        if conn_count == 0:
-            raise SapGuiError("SAP GUI is running but you are not logged on to any system.")
-
-        if connection_index >= conn_count:
-            connection_index = 0
-        connection = application.Children(connection_index)
-
-        try:
-            sess_count = int(connection.Children.Count)
-        except Exception:
-            sess_count = 1
-        if sess_count == 0:
-            raise SapGuiError("The SAP connection has no open session.")
-        if session_index >= sess_count:
-            session_index = 0
-
-        session = connection.Children(session_index)
+            raise SapGuiError(
+                f"Could not open SAP session {connection_index}:{session_index} ({exc})."
+            ) from exc
 
         try:
             if bool(session.Busy):
@@ -170,28 +377,8 @@ class SapSession:
     @staticmethod
     def list_sessions(log: LogFn = _noop) -> List[str]:
         """Human-readable list of every open session, for the session picker."""
-        import win32com.client
-
-        out: List[str] = []
-        try:
-            app = win32com.client.GetObject("SAPGUI").GetScriptingEngine
-        except Exception:
-            return out
-        try:
-            for ci in range(int(app.Connections.Count)):
-                conn = app.Children(ci)
-                for si in range(int(conn.Children.Count)):
-                    sess = conn.Children(si)
-                    info = sess.Info
-                    out.append(
-                        f"{ci}:{si}  {_safe(info, 'SystemName')} "
-                        f"client {_safe(info, 'Client')} "
-                        f"user {_safe(info, 'User')} "
-                        f"[{_safe(info, 'Transaction')}]"
-                    )
-        except Exception:
-            pass
-        return out
+        entries, _notes = enumerate_sessions(log)
+        return [entry.label for entry in entries]
 
     def describe_session(self) -> str:
         try:
